@@ -1,0 +1,865 @@
+substitutions:
+  homeassistant_url: #Enter your HA adress: http://homeassistant.local:8123 or https://homeassistant.local:8443
+  bambulab_printer: #Enter your printer entity name from homeassistant
+  bambulab_icon: #custom icon on page one: images/bambuicon.png
+
+esphome:
+  name: round-esp32
+  friendly_name: PrintSphere-Display
+  min_version: 2025.9.0
+  name_add_mac_suffix: false
+    
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+globals:
+  - id: ui_built
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ui_col_now
+    type: uint32_t
+    restore_value: no
+    initial_value: "0x00FF00"
+  - id: ui_col_target
+    type: uint32_t
+    restore_value: no
+    initial_value: "0x00FF00"
+  - id: last_prog
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: print_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+# ---------- HA-Entities ----------
+sensor:
+  - platform: homeassistant
+    id: print_progress
+    entity_id: sensor.${bambulab_printer}_print_progress
+    internal: true
+  - platform: homeassistant
+    id: nozzle_temp
+    entity_id: sensor.${bambulab_printer}_nozzle_temperature
+    internal: true
+  - platform: homeassistant
+    id: bed_temp
+    entity_id: sensor.${bambulab_printer}_bed_temperature
+    internal: true
+  - platform: homeassistant
+    id: remaining_time
+    entity_id: sensor.${bambulab_printer}_remaining_time
+    internal: true
+  - platform: homeassistant
+    id: current_layer
+    entity_id: sensor.${bambulab_printer}_current_layer
+    internal: true
+  - platform: homeassistant
+    id: total_layer
+    entity_id: sensor.${bambulab_printer}_total_layer_count
+    internal: true
+
+online_image:
+  - id: ha_preview
+    # Start-URL ist egal – wir überschreiben sie gleich via set_url
+    url: "${homeassistant_url}/api/image_proxy/image.${bambulab_printer}_titelbild"
+    format: PNG
+    type: RGB565
+    resize: 420x420
+    placeholder: img_blank
+    request_headers:
+      Accept: image/png,image/jpeg;q=0.9,*/*;q=0.1
+      Accept-Encoding: identity
+    on_download_finished:
+      then:
+        - lvgl.image.update:
+            id: img_preview
+            src: ha_preview
+        - delay: 50ms
+        - lambda: |-
+            using namespace esphome::lvgl;
+            // Scroll/Touch sicher aus
+            lv_obj_set_scrollbar_mode(id(img_mask), LV_SCROLLBAR_MODE_OFF);
+            lv_obj_clear_flag(id(img_mask), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(id(img_preview), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            // Optional: Hinweis ausblenden, sobald ein Bild da ist
+            lv_obj_add_flag(id(page2_note), LV_OBJ_FLAG_HIDDEN);
+            // Zoom zurücksetzen, dann Größe lesen
+            lv_img_set_zoom(id(img_preview), 256);  // 256 = 1.0x
+            int w = lv_obj_get_width(id(img_preview));
+            int h = lv_obj_get_height(id(img_preview));
+            // "cover" auf 420er Kreis
+            if (w > 0 && h > 0) {
+              const int D = 420;
+              int z_w = (D * 256 + w - 1) / w;   // ceil(D/w)
+              int z_h = (D * 256 + h - 1) / h;   // ceil(D/h)
+              int z   = (z_w > z_h) ? z_w : z_h; // COVER
+              if (z < 16)   z = 16;
+              if (z > 1024) z = 1024;
+              lv_img_set_zoom(id(img_preview), z);
+            }
+            lv_obj_center(id(img_preview));
+            lv_obj_invalidate(id(img_preview));
+
+text_sensor:
+  - platform: homeassistant
+    id: current_stage
+    entity_id: sensor.${bambulab_printer}_current_stage
+    internal: true
+  - platform: homeassistant
+    id: print_status
+    entity_id: sensor.${bambulab_printer}_print_status
+    internal: true
+  - platform: homeassistant
+    id: ha_img_url
+    entity_id: image.${bambulab_printer}_titelbild
+    attribute: entity_picture
+    internal: true
+    on_value:
+      - online_image.set_url:
+          id: ha_preview
+          url: !lambda |-
+            std::string u = id(ha_img_url).state;
+            if (u.rfind("http://",0)!=0 && u.rfind("https://",0)!=0)
+              u = std::string("${homeassistant_url}") + u;
+            return u;
+          update: true
+                    
+binary_sensor:
+  - platform: homeassistant
+    id: hms_errors
+    entity_id: binary_sensor.${bambulab_printer}_hms_errors
+    internal: true
+  - platform: homeassistant
+    id: druckfehler
+    entity_id: binary_sensor.${bambulab_printer}_druckfehler
+    internal: true
+
+time:
+  - platform: homeassistant
+    id: esptime
+
+http_request:
+  id: httpc
+  timeout: 10s
+  verify_ssl: false
+
+image:
+  - file: ${bambulab_icon}
+    id: img_blank
+    type: RGB565
+
+# ---------- QSPI ----------
+spi:
+  - id: qspi_bus
+    type: quad
+    interface: spi3
+    clk_pin: GPIO10
+    data_pins: [GPIO11, GPIO12, GPIO13, GPIO14]
+
+# --- I²C (Touch) ---
+i2c:
+  - id: touch_i2c
+    sda: GPIO47
+    scl: GPIO48
+    scan: true
+    frequency: 400kHz
+
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    i2c_id: touch_i2c
+    address: 0x38
+    update_interval: 20ms
+    transform:
+      swap_xy: false
+      mirror_x: false
+      mirror_y: false
+
+lvgl:
+  id: ui
+  color_depth: 16
+  displays: [my_display]
+  touchscreens: [touch]
+  widgets:
+    - image:
+        id: img_preview
+        src: ha_preview    # <-- vorher: img_blank
+        antialias: true
+        radius: 12
+    - image:
+        id: img_logo_small
+        src: img_blank
+        antialias: true
+        radius: 8   
+    - obj:
+        id: img_mask
+        width: 420         # passend zu online_image.resize
+        height: 420
+        radius: 210        # Kreis
+        bg_opa: 0
+        border_opa: 0     
+    - obj:
+        id: backdrop
+        width: 466
+        height: 466
+        align: center
+        bg_color: 0x000000
+        bg_opa: 0
+        border_opa: 0
+
+        # ---- PROGRESS RING ----
+    - arc:
+        id: arc_main
+        align: center
+        width: 466
+        height: 466
+        min_value: 0
+        max_value: 100
+        value: 0
+        rotation: 270
+        start_angle: 0
+        end_angle: 360
+        bg_opa: 0
+        border_opa: 0
+        pad_all: 0
+        arc_width: 24
+        arc_color: 0x101010
+        arc_rounded: true
+        indicator:
+          arc_width: 24
+          arc_color: 0x00FF00
+          arc_rounded: true
+
+    # --- labels etc. (unchanged defs) ---
+    - label: { id: lbl_pct, text: "--%", align: center, x: 0, y: -170, text_color: 0xFFFFFF, text_font: font_dosis_40 }
+    - label: { id: lbl_layer, text: "Layer: -- / --", text_color: 0xDDDDDD, text_font: font_dosis_32 }
+    - label: { id: lbl_status, text: "Waiting for Data...", text_color: 0xFFFFFF, text_font: font_dosis_32 }
+    #- label: { id: lbl_remaining, text: "Rest: --m", text_color: 0x87CEEB, text_font: font_dosis_40 }
+    - label: { id: lbl_nozzle_icon, text: "\U000F0E5B", text_color: 0xFFFFFF, text_font: font_mdi_40 }
+    - label: { id: lbl_bed_icon,    text: "\U000F185B", text_color: 0xFFFFFF, text_font: font_mdi_40 }
+    - label: { id: lbl_nozzle, text: " --°C", text_color: 0xFFFFFF, text_font: font_dosis_32 }
+    - label: { id: lbl_bed,    text: " --°C", text_color: 0xFFFFFF, text_font: font_dosis_32 }
+    - label: { id: page2_note, text: "Preview deaktiviert", align: center, text_color: 0x888888, text_font: font_dosis_20 }
+    - obj:
+        id: row_remaining
+        bg_opa: 0
+        border_opa: 0
+        pad_all: 0
+        layout:
+          type: FLEX
+          flex_flow: ROW
+          flex_align_cross: CENTER
+        widgets:
+          - label:
+              id: lbl_remaining_icon
+              text: "\U000F144E"       # mdiClockTimeFourOutline
+              text_font: font_mdi_40
+              text_color: 0x87CEEB
+              pad_right: 8             # Abstand zum Text
+          - label:
+              id: lbl_remaining
+              text: " --m"
+              text_font: font_dosis_40
+              text_color: 0x87CEEB
+
+# ---- FONTS ----
+font:
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_20
+    size: 20
+    glyphs:
+      - '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ '
+      - '°'
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_24
+    size: 24
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_32
+    size: 32
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_40
+    size: 40
+  - file: fonts/materialdesignicons-webfont.ttf
+    id: font_mdi_40
+    size: 40
+    bpp: 4
+    glyphs: ["\U000F144E", "\U000F0E5B", "\U000F185B"]    # mdiClockTimeFourOutline
+
+# ---------- Display ----------
+display:
+  - platform: mipi_spi
+    model: CO5300
+    id: my_display
+    bus_mode: quad
+    cs_pin: GPIO9
+    reset_pin: GPIO21
+    brightness: 248
+    #transform:
+    #  swap_xy: true
+    #  mirror_x: true
+    #  mirror_y: true
+    dimensions:
+      height: 466
+      width: 466
+    data_rate: 80000000
+    spi_mode: MODE0
+    rotation: 0 # 270 when transform (90° rotation towards USB port)
+    invert_colors: false
+
+
+# ---------- UI-Update ----------
+interval:
+  - interval: 300ms
+    then:
+      - lambda: |-
+          using namespace esphome::lvgl;
+          if (id(ui_built)) return;
+          if (lv_disp_get_default() == nullptr) return;
+
+          lv_obj_t* scr = lv_scr_act();
+
+          // black screen
+          lv_disp_set_theme(lv_disp_get_default(), nullptr);
+          lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
+          lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+
+          // pager with 2 pages
+          const int W = 466, H = 466;
+          lv_obj_t* pager = lv_obj_create(scr);
+          lv_obj_set_size(pager, W, H);
+          lv_obj_center(pager);
+          lv_obj_set_scroll_dir(pager, LV_DIR_HOR);
+          lv_obj_set_scroll_snap_x(pager, LV_SCROLL_SNAP_CENTER);
+          lv_obj_set_style_bg_opa(pager, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(pager, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_pad_all(pager, 0, LV_PART_MAIN);
+          lv_obj_set_scrollbar_mode(pager, LV_SCROLLBAR_MODE_OFF);
+
+          lv_obj_t* page1 = lv_obj_create(pager);
+          lv_obj_set_size(page1, W, H);
+          lv_obj_set_style_bg_opa(page1, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(page1, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_pos(page1, 0, 0);
+          
+          // page2
+          lv_obj_t* page2 = lv_obj_create(pager);
+          lv_obj_set_size(page2, W, H);
+          lv_obj_set_style_bg_opa(page2, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(page2, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_pos(page2, W, 0);
+
+          // page 1 content
+          lv_obj_set_parent(id(lbl_status), page1);
+          lv_obj_align(id(lbl_status), LV_ALIGN_CENTER, 0, -86);
+
+          lv_obj_set_parent(id(lbl_layer), page1);
+          lv_obj_align(id(lbl_layer), LV_ALIGN_CENTER, 0, 70);  
+
+          lv_obj_set_parent(id(row_remaining), page1);
+          lv_obj_set_width(id(row_remaining), LV_SIZE_CONTENT);
+          lv_obj_clear_flag(id(row_remaining), LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_update_layout(id(row_remaining));
+          lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 180);
+          lv_obj_move_foreground(id(row_remaining));
+
+          // === Always-on: Nozzle & Bed frei platzierbar (unabhängig von Pages) ===
+          // Parent auf Root-Screen
+          // --- kleines Logo (img_blank) zentriert auf Page 1 ---
+          lv_obj_set_parent(id(img_logo_small), page1);
+          {
+            int w = lv_obj_get_width(id(img_logo_small));
+            int h = lv_obj_get_height(id(img_logo_small));
+            if (w > 0 && h > 0) {
+              const int TARGET = 86;
+              int z = std::min((TARGET*256)/w, (TARGET*256)/h);
+              if (z > 256) z = 256;
+              if (z < 16)  z = 16;
+              lv_img_set_zoom(id(img_logo_small), z);
+            }
+          }
+          lv_obj_align(id(img_logo_small), LV_ALIGN_CENTER, 0, -7);
+          
+          // === Nozzle & Bed NUR auf Page 1 ===
+          lv_obj_set_parent(id(lbl_nozzle_icon), page1);
+          lv_obj_set_parent(id(lbl_nozzle),      page1);
+          lv_obj_set_parent(id(lbl_bed_icon),    page1);
+          lv_obj_set_parent(id(lbl_bed),         page1);
+          
+          // Positionen wie gehabt (relativ zum Page-1-Zentrum)
+          const int NOZZLE_ICON_X = -182, NOZZLE_ICON_Y = -10;
+          const int NOZZLE_TEXT_X = -132, NOZZLE_TEXT_Y = -10;
+          const int BED_ICON_X    =  110, BED_ICON_Y    = -10;
+          const int BED_TEXT_X    =  160, BED_TEXT_Y    = -10;
+          
+          lv_obj_align(id(lbl_nozzle_icon), LV_ALIGN_CENTER, NOZZLE_ICON_X, NOZZLE_ICON_Y);
+          lv_obj_align(id(lbl_nozzle),      LV_ALIGN_CENTER, NOZZLE_TEXT_X, NOZZLE_TEXT_Y);
+          lv_obj_align(id(lbl_bed_icon),    LV_ALIGN_CENTER, BED_ICON_X, BED_ICON_Y);
+          lv_obj_align(id(lbl_bed),         LV_ALIGN_CENTER, BED_TEXT_X, BED_TEXT_Y);
+
+          // main arc (immer oben)
+          lv_obj_set_parent(id(arc_main), lv_layer_top());
+          lv_obj_center(id(arc_main));
+          lv_obj_move_foreground(id(arc_main));
+          // sicherstellen, dass er keine Touches blockt
+          lv_obj_clear_flag(id(arc_main), LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+          
+          // %-Label (auch oben, damit es nie verdeckt wird)
+          const int RING_SIZE = 466;
+          const int PCT_MARGIN_FROM_TOP = 46;
+          lv_obj_set_parent(id(lbl_pct), lv_layer_top());
+          lv_obj_align(id(lbl_pct), LV_ALIGN_CENTER, 0, -(RING_SIZE/2 - PCT_MARGIN_FROM_TOP));
+          lv_obj_move_foreground(id(lbl_pct));
+
+          // (Optional) Innerhalb von Page 1 die vier Labels nach vorn
+          for (auto obj : { id(lbl_nozzle_icon), id(lbl_nozzle), id(lbl_bed_icon), id(lbl_bed) }) {
+            lv_obj_move_foreground(obj);
+          }
+          // page 2
+          lv_obj_set_parent(id(page2_note), page2);
+          lv_obj_align(id(page2_note), LV_ALIGN_CENTER, 0, 0);
+          lv_obj_set_style_text_color(id(page2_note), lv_color_hex(0x888888), LV_PART_MAIN);
+          
+          // runde Maske als Parent
+          lv_obj_set_parent(id(img_mask), page2);
+          lv_obj_align(id(img_mask), LV_ALIGN_CENTER, 0, 0);
+          lv_obj_set_style_clip_corner(id(img_mask), true, LV_PART_MAIN);
+          lv_obj_set_scrollbar_mode(id(img_mask), LV_SCROLLBAR_MODE_OFF);
+          lv_obj_clear_flag(id(img_mask), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+          
+          // Bild in die Maske
+          lv_obj_set_parent(id(img_preview), id(img_mask));
+          lv_obj_center(id(img_preview));
+          lv_obj_clear_flag(id(img_preview), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+          
+          // Auf Seite 1 starten
+          lv_obj_scroll_to_view(page1, LV_ANIM_OFF);
+          id(ui_built) = true;
+
+  - interval: 30ms
+    then:
+      - lambda: |-
+          using namespace esphome::lvgl;
+          // ---- helpers ----
+          auto lerp8 = [&](uint8_t a,uint8_t b,float t)->uint8_t { return (uint8_t) lroundf(a + (b-a)*t); };
+          auto pulse_between = [&](uint32_t lo,uint32_t hi,uint32_t period_ms)->uint32_t {
+            const float PI=3.14159265f;
+            float s = 0.5f + 0.5f * sinf((millis() % period_ms) * 2.0f * PI / period_ms);
+            uint8_t lr=(lo>>16)&0xFF, lg=(lo>>8)&0xFF, lb= lo     &0xFF;
+            uint8_t hr=(hi>>16)&0xFF, hg=(hi>>8)&0xFF, hb= hi     &0xFF;
+            return ((uint32_t)lerp8(lr,hr,s)<<16) | ((uint32_t)lerp8(lg,hg,s)<<8) | lerp8(lb,hb,s);
+          };
+          auto set_ring = [&](uint32_t main_col, uint32_t ind_col){
+            lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(main_col), LV_PART_MAIN);
+            lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(ind_col),  LV_PART_INDICATOR);
+          };
+  
+          // Smooth-Blend für Normalzustand
+          auto step_to = [](uint8_t cur, uint8_t tgt, uint8_t step)->uint8_t {
+            int d = (int)tgt - (int)cur;
+            if (d>0) return (uint8_t)(cur + std::min(d,(int)step));
+            if (d<0) return (uint8_t)(cur - std::min(-d,(int)step));
+            return cur;
+          };
+          const uint8_t STEP = 25;
+          uint32_t c_now = id(ui_col_now);
+          uint32_t c_tgt = id(ui_col_target);
+          uint8_t rn=(c_now>>16)&0xFF, gn=(c_now>>8)&0xFF, bn=c_now&0xFF;
+          uint8_t rt=(c_tgt>>16)&0xFF, gt=(c_tgt>>8)&0xFF, bt=c_tgt&0xFF;
+          uint8_t r = step_to(rn, rt, STEP);
+          uint8_t g = step_to(gn, gt, STEP);
+          uint8_t b = step_to(bn, bt, STEP);
+          uint32_t mixed = ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+  
+          // Texte + Progress holen
+          auto lower = [](std::string s){ for(auto &c:s) c=(char)tolower((unsigned char)c); return s; };
+          std::string stage = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+          std::string ps    = id(print_status).has_state()  ? lower(id(print_status).state)  : "";
+          int prog = id(print_progress).has_state() ? (int) id(print_progress).state : id(last_prog);
+          if (prog < 0) prog = 0;
+          if (prog > 100) prog = 100;
+                    
+          // 1) FILAMENT loading/unloading – hat Prio
+          bool is_loading   = stage.find("filament_loading")   != std::string::npos;
+          bool is_unloading = stage.find("filament_unloading") != std::string::npos;
+          if (is_loading || is_unloading) {
+            const uint32_t COL_BASE   = 0x101010, COL_YELLOW = 0xFFD54F;
+            lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(COL_BASE),   LV_PART_MAIN);
+            lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(COL_YELLOW), LV_PART_INDICATOR);
+          
+            const uint32_t T_FILL_MS=2000U, T_HOLD_MS=300U, CYCLE=T_FILL_MS+T_HOLD_MS;
+            uint32_t t = millis() % CYCLE;
+            int value;
+            if (t < T_FILL_MS) {
+              float f = (float)t / (float)T_FILL_MS;
+              value = is_loading ? (int)lroundf(f*100.f) : (int)lroundf((1.f - f)*100.f);
+            } else value = is_loading ? 100 : 0;
+            lv_arc_set_value(id(arc_main), value);
+            return;
+          }
+          
+          // 2) Fehler
+          bool err_hms   = id(hms_errors).has_state()  && id(hms_errors).state;
+          bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
+          bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
+          if (ps_failed || err_hms || err_print) {
+            uint32_t c = pulse_between(0x220000, 0xFF3333, 1600);
+            set_ring(c, c);
+            return;
+          }
+          
+          // 3) Fertig?
+          bool finished = (prog >= 100) || (ps == "finish") || (ps.find("finish") != std::string::npos);
+          if (finished) { set_ring(0x00FFFF, 0x00FFFF); return; }
+          
+          // 4) Idle, aber NICHT fertig → „weiter druckend“ darstellen
+          bool idleish = stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos;
+          if (idleish) {
+            if (ps == "prepare") {
+              uint32_t c = pulse_between(0x3A1F00, 0xFFA500, 1400);
+              set_ring(c, c);
+              return;
+            }
+            // Wenn noch aktiv ODER Fortschritt zw. 1..99 ⇒ weiter "printing"-Look
+            if (id(print_active) || (prog > 0 && prog < 100)) {
+              id(ui_col_now) = mixed;
+              set_ring(0x101010, mixed);
+              return;
+            }
+            // Wirklich Idle (kein aktiver Job, kein Fortschritt)
+            set_ring(0x404040, 0x404040);
+            return;
+          }
+          
+          // 5) weitere Stages
+          if (stage.find("heatbed_preheating") != std::string::npos
+           || stage.find("nozzle_preheating")  != std::string::npos
+           || stage.find("preheat")            != std::string::npos) {
+            uint32_t c = pulse_between(0x3A1F00, 0xFFA500, 1400); set_ring(c, c); return;
+          }
+          if (stage.find("cleaning_nozzle_tip") != std::string::npos
+           || stage.find("clean")               != std::string::npos) {
+            uint32_t c = pulse_between(0x404040, 0xFFFFFF, 1200); set_ring(c, c); return;
+          }
+          if (stage.find("auto_bed_leveling") != std::string::npos
+           || stage.find("bed_level")         != std::string::npos) {
+            uint32_t c = pulse_between(0x220033, 0xAA66FF, 1400); set_ring(c, c); return;
+          }
+          
+          // 6) Default (Printing)
+          id(ui_col_now) = mixed;
+          set_ring(0x101010, mixed);
+
+
+  # Daten & Status
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto lower = [](std::string s){ for(auto &c:s) c=(char)tolower((unsigned char)c); return s; };
+      
+          // Progress lesen + puffern
+          int p = id(print_progress).has_state() ? (int) id(print_progress).state : id(last_prog);
+          if (p < 0) p = 0;
+          if (p > 100) p = 100;
+          if (id(print_progress).has_state()) id(last_prog) = p;  // nur bei echtem Update überschreiben
+      
+          // Status & Stage
+          std::string ps = id(print_status).has_state() ? lower(id(print_status).state) : "";
+          std::string st = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+      
+          bool finished = (p >= 100) || ps == "finish" || ps.find("finish") != std::string::npos;
+          bool failed   = ps == "failed" || ps.find("fail") != std::string::npos;
+      
+          // Aktiv-Logik:
+          // - aktiv, sobald Fortschritt (1..99) oder Status "running/prepare/printing"
+          // - deaktiv, wenn finished oder failed
+          bool running_like = (ps == "running") || (ps == "prepare") || (ps.find("print") != std::string::npos);
+          if (failed || finished) {
+            id(print_active) = false;
+          } else if (running_like || (p > 0 && p < 100)) {
+            id(print_active) = true;
+          }
+      - lvgl.arc.update:
+          id: arc_main
+          value: !lambda |-
+            // während filament_loading/unloading NICHT updaten (Animation behält Kontrolle)
+            auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
+            if (id(current_stage).has_state()) {
+              std::string st = lower(id(current_stage).state);
+              if (st.find("filament_loading") != std::string::npos || st.find("filament_unloading") != std::string::npos) {
+                return (int) lv_arc_get_value(id(arc_main));
+              }
+            }
+            if (id(print_progress).has_state()) {
+              int p = (int) id(print_progress).state;
+              if (p < 0) p = 0; if (p > 100) p = 100;
+              return p;
+            }
+            return 0;
+      - lvgl.label.update:
+          id: lbl_pct
+          text: !lambda |-
+            if (id(print_progress).has_state()) {
+              char buf[16]; snprintf(buf, sizeof(buf), "%d%%", (int) id(print_progress).state);
+              return std::string(buf);
+            }
+            return std::string("--%");
+      - lambda: |-
+          lv_obj_set_style_text_color(id(lbl_pct), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+
+      - lvgl.label.update:
+          id: lbl_status
+          text: !lambda |-
+            auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
+            std::string stage = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+            std::string ps    = id(print_status).has_state()  ? lower(id(print_status).state)  : "";
+            int prog = id(print_progress).has_state() ? (int)id(print_progress).state : 0;
+            if (prog < 0) prog = 0; if (prog > 100) prog = 100;
+
+            // loading/unloading top
+            if (stage.find("filament_loading")   != std::string::npos) return std::string("loading");
+            if (stage.find("filament_unloading") != std::string::npos) return std::string("unloading");
+
+            // Fehler
+            bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
+            bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
+            bool err_hms   = id(hms_errors).has_state()   && id(hms_errors).state;
+            if (ps_failed || err_print || err_hms) return std::string("failed");
+
+            // Fertig?
+            bool finished = (prog >= 100) || (ps == "finish") || (ps.find("finish") != std::string::npos);
+            if (finished) return std::string("done");
+
+            // Idle, aber nicht fertig → sinnvoll texten
+            bool idleish = stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos;
+            if (idleish) {
+              if (ps == "prepare") return std::string("preparing");
+              if (prog > 0)        return std::string("printing");
+              return std::string("idle");
+            }
+            // hübsche Mapper
+            auto pretty_stage = [&](const std::string& t)->std::string {
+              if (t.find("printing")            != std::string::npos) return "printing";
+              if (t.find("auto_bed_leveling")   != std::string::npos
+               || t.find("bed_level")           != std::string::npos) return "bed level";
+              if (t.find("heatbed_preheating")  != std::string::npos
+               || t.find("nozzle_preheating")   != std::string::npos
+               || t.find("preheat")             != std::string::npos) return "preheating";
+              if (t.find("cleaning_nozzle_tip") != std::string::npos
+               || t.find("clean")               != std::string::npos) return "clean nozzle";
+              if (t.find("cooling_down")        != std::string::npos
+               || t.find("cool")                != std::string::npos) return "cooling";
+              if (t == "idle")      return "idle";
+              if (t == "offline")   return "offline";
+              return "";
+            };
+            auto pretty_ps = [&](const std::string& t)->std::string {
+              if (t == "prepare")  return "preparing";
+              if (t == "running")  return "printing";
+              if (t == "finish" || t == "finished") return "done";
+              if (t == "failed")   return "failed";
+              if (t.find("pause")  != std::string::npos) return "paused";
+              if (t.find("cool")   != std::string::npos) return "cooling";
+              return "";
+            };
+            auto titlecase = [](std::string s)->std::string {
+              for (auto &ch : s) if (ch=='_' || ch=='-') ch=' ';
+              bool cap=true; for (auto &ch : s){ if (cap && isalpha((unsigned char)ch)) { ch=(char)toupper((unsigned char)ch); cap=false; } else if (ch==' ') cap=true; else ch=(char)tolower((unsigned char)ch); }
+              std::string out; out.reserve(s.size()); bool sp=false; for(char ch: s){ if(ch==' '){ if(!sp){out.push_back(' '); sp=true;} } else { out.push_back(ch); sp=false; } } return out;
+            };
+            auto shorten = [&](std::string s, size_t n)->std::string { if (s.size()<=n) return s; return n<=3 ? s.substr(0,n) : s.substr(0,n-3)+"..."; };
+
+            // stage bevorzugen, wenn sinnvoll
+            std::string s1 = pretty_stage(stage);
+            if (!s1.empty() && stage.find("idle")==std::string::npos && stage.find("offline")==std::string::npos) return s1;
+
+            // fallback: print_status (prepare/running/…)
+            std::string s2 = pretty_ps(ps);
+            if (!s2.empty()) return s2;
+
+            // Fallbacks
+            if (!stage.empty()) return shorten(titlecase(stage), 18);
+            if (!ps.empty())    return shorten(titlecase(ps),    18);
+            return std::string("waiting...");
+
+      # --- Status-Farbe passend setzen (Fehler rot, idle/offline grau, sonst weiß) ---
+      - lambda: |-
+          using namespace esphome::lvgl;
+          auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
+          std::string stage = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+          std::string ps    = id(print_status).has_state()  ? lower(id(print_status).state)  : "";
+          int prog = id(print_progress).has_state() ? (int)id(print_progress).state : 0;
+          if (prog < 0) prog = 0; if (prog > 100) prog = 100;
+          
+          // loading/unloading = gelb
+          if (stage.find("filament_loading") != std::string::npos
+           || stage.find("filament_unloading") != std::string::npos) {
+            lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFD54F), LV_PART_MAIN);
+            return;
+          }
+          
+          // Fehler = rot
+          bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
+          bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
+          bool err_hms   = id(hms_errors).has_state()   && id(hms_errors).state;
+          if (ps_failed || err_print || err_hms) {
+            lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFF3333), LV_PART_MAIN);
+            return;
+          }
+          
+          // fertig = blau
+          bool finished = (prog >= 100) || (ps == "finish") || (ps.find("finish") != std::string::npos);
+          if (finished) {
+            lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x00BFFF), LV_PART_MAIN);
+            return;
+          }
+          
+          // idle/offline aber nicht fertig
+          bool idleish = stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos;
+          if (idleish) {
+            if (ps == "prepare") {
+              lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFA500), LV_PART_MAIN); // orange
+            } else if (prog > 0) {
+              lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFFFFF), LV_PART_MAIN); // weiß (printing)
+            } else {
+              lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xAAAAAA), LV_PART_MAIN); // grau (echtes idle)
+            }
+            return;
+          }
+          
+          // restliche Stages wie gehabt …
+          if (stage.find("heatbed_preheating") != std::string::npos
+           || stage.find("nozzle_preheating")  != std::string::npos
+           || stage.find("preheat")            != std::string::npos
+           || stage.find("cleaning_nozzle_tip")!= std::string::npos
+           || stage.find("clean")              != std::string::npos
+           || stage.find("auto_bed_leveling")  != std::string::npos
+           || stage.find("bed_level")          != std::string::npos) {
+            lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFA500), LV_PART_MAIN);
+          } else if (stage.find("cooling_down") != std::string::npos || stage.find("cool") != std::string::npos) {
+            lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x87CEEB), LV_PART_MAIN);
+          } else {
+            lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          }
+
+
+      - lvgl.label.update:
+          id: lbl_remaining
+          text: !lambda |-
+            int p = id(print_progress).has_state() ? (int) id(print_progress).state : 0;
+            std::string st = id(print_status).has_state() ? id(print_status).state : "";
+            if (p >= 100 || st.find("finish") != std::string::npos || st.find("done") != std::string::npos) {
+              return std::string("Done");
+            }
+            if (id(remaining_time).has_state()) {
+              int minutes = (int) id(remaining_time).state;
+              if (minutes < 0) minutes = 0;
+              int h = minutes / 60, m = minutes % 60;
+              char buf[32];
+              if (h > 0) snprintf(buf, sizeof(buf), "%dh %dm", h, m);
+              else       snprintf(buf, sizeof(buf), "%dm", m);
+              return std::string(buf);
+            }
+            return std::string("--m");
+      - lambda: |-
+          // Farbe angleichen
+          lv_obj_set_style_text_color(id(lbl_remaining),      lv_color_hex(0x87CEEB), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(lbl_remaining_icon), lv_color_hex(0x87CEEB), LV_PART_MAIN);
+          
+          // Breite nach Inhalt + neu zentrieren (verhindert Abschneiden/Scrollen)
+          auto w_before = lv_obj_get_width(id(row_remaining));
+          lv_obj_set_width(id(row_remaining), LV_SIZE_CONTENT);
+          lv_obj_clear_flag(id(row_remaining), LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_update_layout(id(row_remaining));
+          auto w_after = lv_obj_get_width(id(row_remaining));
+          if (w_after != w_before) {
+            lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 180);
+          }
+
+         
+
+      - lvgl.label.update:
+          id: lbl_layer
+          text: !lambda |-
+            int cur = id(current_layer).has_state() ? (int) id(current_layer).state : -1;
+            int tot = id(total_layer).has_state()   ? (int) id(total_layer).state   : -1;
+            char buf[32];
+            if (cur >= 0 && tot >= 0) {
+              if (cur > tot) cur = tot;
+              snprintf(buf, sizeof(buf), "layer: %d / %d", cur, tot);
+            } else if (cur >= 0) {
+              snprintf(buf, sizeof(buf), "layer: %d / --", cur);
+            } else if (tot >= 0) {
+              snprintf(buf, sizeof(buf), "layer: -- / %d", tot);
+            } else {
+              snprintf(buf, sizeof(buf), "layer: -- / --");
+            }
+            return std::string(buf);
+      - lambda: |-
+          lv_obj_set_style_text_color(id(lbl_layer), lv_color_hex(0xDDDDDD), LV_PART_MAIN);
+
+      - lvgl.label.update:
+          id: lbl_nozzle
+          text: !lambda |-
+            if (id(nozzle_temp).has_state()) {
+              char buf[24]; snprintf(buf, sizeof(buf), " %d°C", (int) id(nozzle_temp).state);
+              return std::string(buf);
+            }
+            return std::string(" --°C");
+      - lambda: |-
+          lv_obj_set_style_text_color(id(lbl_nozzle), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+
+      - lvgl.label.update:
+          id: lbl_bed
+          text: !lambda |-
+            if (id(bed_temp).has_state()) {
+              char buf[24]; snprintf(buf, sizeof(buf), " %d°C", (int) id(bed_temp).state);
+              return std::string(buf);
+            }
+            return std::string(" --°C");
+      - lambda: |-
+          lv_obj_set_style_text_color(id(lbl_bed), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+
+      # Farbe je nach "current_stage"/Status
+      - lambda: |-
+          auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
+          std::string s;
+          if (id(current_stage).has_state()) s = lower(id(current_stage).state);
+          if (s.empty() && id(print_status).has_state()) s = lower(id(print_status).state);
+
+          uint32_t col = 0x00FF00; // drucken
+          if (s.find("fertig") != std::string::npos || s.find("beendet") != std::string::npos
+              || s.find("finish") != std::string::npos || s.find("done") != std::string::npos) {
+            col = 0x00BFFF;        // fertig
+          } else if (s.find("heizbett") != std::string::npos || s.find("vorwärm") != std::string::npos
+               || s.find("wärm") != std::string::npos || s.find("reinig") != std::string::npos) {
+            col = 0xFF3333;        // aufheizen
+          } else if (s.find("abkühl") != std::string::npos || s.find("kühl") != std::string::npos) {
+            col = 0x3399FF;        // abkühlen
+          } else if (s.find("automatische bettnivellierung") != std::string::npos || s.find("nivell") != std::string::npos) {
+            col = 0xFFA500;        // leveling/pausiert
+          } else if (s.find("pause") != std::string::npos) {
+            col = 0xFFA500;
+          } else if (s.find("leerlauf") != std::string::npos || s.find("idle") != std::string::npos || s.find("offline") != std::string::npos) {
+            col = 0x666666;        // idle
+          }
+          id(ui_col_target) = col;
