@@ -60,10 +60,10 @@ substitutions:
 
 **Binary sensors (optional, errors)**
 - `binary_sensor.<printer>_hms_errors`
-- `binary_sensor.<printer>_druckfehler`
+- `binary_sensor.<printer>_druckfehler` (need to be translated to other language if needed)
 
 **Image entity (for Page 2, round preview)**
-- `image.<printer>_titelbild` (its `entity_picture` is used)
+- `image.<printer>_titelbild` (its `entity_picture` is used) 
 
 > Without `image.<printer>_titelbild`, Page 2 shows “Preview disabled”.
 
