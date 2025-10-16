@@ -4,12 +4,11 @@ A 🟢 ESP32-S3 display for Bambu Lab / Home Assistant print status:
 - large progress ring
 - two-page UI (LVGL) (status info + round preview image)
 - colors/animations per stage/status
-<p align="left">
-  <img src="assets/20251016_231350.jpg" alt="PrintSphere UI: progress ring" width="540">
+<p align="center">
+  <img src="assets/20251016_231350.jpg" alt="PrintSphere UI: progress ring" width="320">
+  <img src="assets/20251016_231340.jpg" alt="PrintSphere UI: preview image" width="320">
 </p>
-<p align="right">
-  <img src="assets/20251016_231340.jpg" alt="PrintSphere UI: progress ring" width="540">
-</p>
+
 ---
 
 ## Hardware
