@@ -228,7 +228,7 @@ lvgl:
   widgets:
     - image:
         id: img_preview
-        src: ha_preview    # <-- vorher: img_blank
+        src: ha_preview
         antialias: true
         radius: 12
     - image:
@@ -238,7 +238,7 @@ lvgl:
         radius: 8   
     - obj:
         id: img_mask
-        width: 420         # passend zu online_image.resize
+        width: 420
         height: 420
         radius: 210        # Kreis
         bg_opa: 0
@@ -417,6 +417,7 @@ interval:
           const int BED_ICON_X    =  110, BED_ICON_Y    = -10;
           const int BED_TEXT_X    =  160, BED_TEXT_Y    = -10;
           
+          //Nozzle & Bed Icon and text
           lv_obj_align(id(lbl_nozzle_icon), LV_ALIGN_CENTER, NOZZLE_ICON_X, NOZZLE_ICON_Y);
           lv_obj_align(id(lbl_nozzle),      LV_ALIGN_CENTER, NOZZLE_TEXT_X, NOZZLE_TEXT_Y);
           lv_obj_align(id(lbl_bed_icon),    LV_ALIGN_CENTER, BED_ICON_X, BED_ICON_Y);
