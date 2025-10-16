@@ -50,6 +50,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+  - id: is_scrolling
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
 # ---------- HA-Entities ----------
 sensor:
@@ -184,6 +188,27 @@ i2c:
     scan: true
     frequency: 400kHz
 
+# ---------- Display ----------
+display:
+  - platform: mipi_spi
+    model: CO5300
+    id: my_display
+    bus_mode: quad
+    cs_pin: GPIO9
+    reset_pin: GPIO21
+    brightness: 248
+    #transform:
+    #  swap_xy: true
+    #  mirror_x: true
+    #  mirror_y: true
+    dimensions:
+      height: 466
+      width: 466
+    data_rate: 80000000
+    spi_mode: MODE0
+    rotation: 180 # 270 when transform (90° rotation towards USB port)
+    invert_colors: false
+
 touchscreen:
   - platform: ft63x6
     id: touch
@@ -192,7 +217,7 @@ touchscreen:
     update_interval: 20ms
     transform:
       swap_xy: false
-      mirror_x: false
+      mirror_x: true
       mirror_y: false
 
 lvgl:
@@ -305,26 +330,7 @@ font:
     bpp: 4
     glyphs: ["\U000F144E", "\U000F0E5B", "\U000F185B"]    # mdiClockTimeFourOutline
 
-# ---------- Display ----------
-display:
-  - platform: mipi_spi
-    model: CO5300
-    id: my_display
-    bus_mode: quad
-    cs_pin: GPIO9
-    reset_pin: GPIO21
-    brightness: 248
-    #transform:
-    #  swap_xy: true
-    #  mirror_x: true
-    #  mirror_y: true
-    dimensions:
-      height: 466
-      width: 466
-    data_rate: 80000000
-    spi_mode: MODE0
-    rotation: 0 # 270 when transform (90° rotation towards USB port)
-    invert_colors: false
+
 
 
 # ---------- UI-Update ----------
@@ -453,12 +459,32 @@ interval:
           
           // Auf Seite 1 starten
           lv_obj_scroll_to_view(page1, LV_ANIM_OFF);
+
+          // === Smooth scrolling: throttle heavy redraws during pager scroll ===
+          lv_obj_add_event_cb(pager, [](lv_event_t* e){
+            lv_event_code_t code = lv_event_get_code(e);
+            if (code == LV_EVENT_SCROLL_BEGIN) {
+              id(is_scrolling) = true; // throttle updates only
+            } else if (code == LV_EVENT_SCROLL_END || code == LV_EVENT_RELEASED) {
+              id(is_scrolling) = false;
+            }
+          }, LV_EVENT_ALL, nullptr);
+
           id(ui_built) = true;
 
   - interval: 30ms
     then:
       - lambda: |-
           using namespace esphome::lvgl;
+
+          // Throttle updates while scrolling (300 ms) – AA bleibt immer AN
+          static uint32_t last_scroll_update = 0;
+          if (id(is_scrolling)) {
+            uint32_t now = millis();
+            if (now - last_scroll_update < 300) return;
+            last_scroll_update = now;
+          }
+
           // ---- helpers ----
           auto lerp8 = [&](uint8_t a,uint8_t b,float t)->uint8_t { return (uint8_t) lroundf(a + (b-a)*t); };
           auto pulse_between = [&](uint32_t lo,uint32_t hi,uint32_t period_ms)->uint32_t {
@@ -472,7 +498,7 @@ interval:
             lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(main_col), LV_PART_MAIN);
             lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(ind_col),  LV_PART_INDICATOR);
           };
-  
+
           // Smooth-Blend für Normalzustand
           auto step_to = [](uint8_t cur, uint8_t tgt, uint8_t step)->uint8_t {
             int d = (int)tgt - (int)cur;
@@ -489,7 +515,7 @@ interval:
           uint8_t g = step_to(gn, gt, STEP);
           uint8_t b = step_to(bn, bt, STEP);
           uint32_t mixed = ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-  
+
           // Texte + Progress holen
           auto lower = [](std::string s){ for(auto &c:s) c=(char)tolower((unsigned char)c); return s; };
           std::string stage = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
@@ -497,7 +523,7 @@ interval:
           int prog = id(print_progress).has_state() ? (int) id(print_progress).state : id(last_prog);
           if (prog < 0) prog = 0;
           if (prog > 100) prog = 100;
-                    
+
           // 1) FILAMENT loading/unloading – hat Prio
           bool is_loading   = stage.find("filament_loading")   != std::string::npos;
           bool is_unloading = stage.find("filament_unloading") != std::string::npos;
@@ -505,7 +531,7 @@ interval:
             const uint32_t COL_BASE   = 0x101010, COL_YELLOW = 0xFFD54F;
             lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(COL_BASE),   LV_PART_MAIN);
             lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(COL_YELLOW), LV_PART_INDICATOR);
-          
+
             const uint32_t T_FILL_MS=2000U, T_HOLD_MS=300U, CYCLE=T_FILL_MS+T_HOLD_MS;
             uint32_t t = millis() % CYCLE;
             int value;
@@ -516,7 +542,7 @@ interval:
             lv_arc_set_value(id(arc_main), value);
             return;
           }
-          
+
           // 2) Fehler
           bool err_hms   = id(hms_errors).has_state()  && id(hms_errors).state;
           bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
@@ -526,12 +552,14 @@ interval:
             set_ring(c, c);
             return;
           }
-          
-          // 3) Fertig?
-          bool finished = (prog >= 100) || (ps == "finish") || (ps.find("finish") != std::string::npos);
-          if (finished) { set_ring(0x00FFFF, 0x00FFFF); return; }
-          
-          // 4) Idle, aber NICHT fertig → „weiter druckend“ darstellen
+
+          // 3) DONE (strikt): ps=finish & stage=idle & prog=100
+          bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                              && (stage.find("idle") != std::string::npos)
+                              && (prog == 100));
+          if (done_strict) { set_ring(0x00FFFF, 0x00FFFF); return; }
+
+          // 4) Idle/Offline, aber NICHT fertig → wie printing/preparing
           bool idleish = stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos;
           if (idleish) {
             if (ps == "prepare") {
@@ -539,17 +567,15 @@ interval:
               set_ring(c, c);
               return;
             }
-            // Wenn noch aktiv ODER Fortschritt zw. 1..99 ⇒ weiter "printing"-Look
             if (id(print_active) || (prog > 0 && prog < 100)) {
               id(ui_col_now) = mixed;
               set_ring(0x101010, mixed);
               return;
             }
-            // Wirklich Idle (kein aktiver Job, kein Fortschritt)
             set_ring(0x404040, 0x404040);
             return;
           }
-          
+
           // 5) weitere Stages
           if (stage.find("heatbed_preheating") != std::string::npos
            || stage.find("nozzle_preheating")  != std::string::npos
@@ -564,7 +590,7 @@ interval:
            || stage.find("bed_level")         != std::string::npos) {
             uint32_t c = pulse_between(0x220033, 0xAA66FF, 1400); set_ring(c, c); return;
           }
-          
+
           // 6) Default (Printing)
           id(ui_col_now) = mixed;
           set_ring(0x101010, mixed);
@@ -586,14 +612,17 @@ interval:
           std::string ps = id(print_status).has_state() ? lower(id(print_status).state) : "";
           std::string st = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
       
-          bool finished = (p >= 100) || ps == "finish" || ps.find("finish") != std::string::npos;
+          // DONE strikt
+          bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                              && (st.find("idle") != std::string::npos)
+                              && (p == 100));
           bool failed   = ps == "failed" || ps.find("fail") != std::string::npos;
       
-          // Aktiv-Logik:
+          // Aktiv-Logik (an Wahrheitstabelle angepasst):
           // - aktiv, sobald Fortschritt (1..99) oder Status "running/prepare/printing"
-          // - deaktiv, wenn finished oder failed
+          // - deaktiv, wenn done_strict oder failed
           bool running_like = (ps == "running") || (ps == "prepare") || (ps.find("print") != std::string::npos);
-          if (failed || finished) {
+          if (failed || done_strict) {
             id(print_active) = false;
           } else if (running_like || (p > 0 && p < 100)) {
             id(print_active) = true;
@@ -635,28 +664,30 @@ interval:
             int prog = id(print_progress).has_state() ? (int)id(print_progress).state : 0;
             if (prog < 0) prog = 0; if (prog > 100) prog = 100;
 
-            // loading/unloading top
+            // 1) Filament
             if (stage.find("filament_loading")   != std::string::npos) return std::string("loading");
             if (stage.find("filament_unloading") != std::string::npos) return std::string("unloading");
 
-            // Fehler
+            // 2) Fehler (außer Filament)
             bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
             bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
             bool err_hms   = id(hms_errors).has_state()   && id(hms_errors).state;
             if (ps_failed || err_print || err_hms) return std::string("failed");
 
-            // Fertig?
-            bool finished = (prog >= 100) || (ps == "finish") || (ps.find("finish") != std::string::npos);
-            if (finished) return std::string("done");
+            // 3) DONE strikt
+            bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                                && (stage.find("idle") != std::string::npos)
+                                && (prog == 100));
+            if (done_strict) return std::string("done");
 
-            // Idle, aber nicht fertig → sinnvoll texten
+            // 4) Idle/Offline aber nicht fertig
             bool idleish = stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos;
             if (idleish) {
               if (ps == "prepare") return std::string("preparing");
               if (prog > 0)        return std::string("printing");
               return std::string("idle");
             }
-            // hübsche Mapper
+            // 5) hübsche Mapper
             auto pretty_stage = [&](const std::string& t)->std::string {
               if (t.find("printing")            != std::string::npos) return "printing";
               if (t.find("auto_bed_leveling")   != std::string::npos
@@ -675,7 +706,7 @@ interval:
             auto pretty_ps = [&](const std::string& t)->std::string {
               if (t == "prepare")  return "preparing";
               if (t == "running")  return "printing";
-              if (t == "finish" || t == "finished") return "done";
+              if (t == "finish" || t == "finished") return "printing"; // nicht "done" ohne strikte Bedingungen
               if (t == "failed")   return "failed";
               if (t.find("pause")  != std::string::npos) return "paused";
               if (t.find("cool")   != std::string::npos) return "cooling";
@@ -701,7 +732,7 @@ interval:
             if (!ps.empty())    return shorten(titlecase(ps),    18);
             return std::string("waiting...");
 
-      # --- Status-Farbe passend setzen (Fehler rot, idle/offline grau, sonst weiß) ---
+      # --- Status-Farbe passend setzen (Fehler rot, idle/offline grau, done blau) ---
       - lambda: |-
           using namespace esphome::lvgl;
           auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
@@ -710,14 +741,14 @@ interval:
           int prog = id(print_progress).has_state() ? (int)id(print_progress).state : 0;
           if (prog < 0) prog = 0; if (prog > 100) prog = 100;
           
-          // loading/unloading = gelb
+          // Filament = gelb
           if (stage.find("filament_loading") != std::string::npos
            || stage.find("filament_unloading") != std::string::npos) {
             lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFD54F), LV_PART_MAIN);
             return;
           }
           
-          // Fehler = rot
+          // Fehler = rot (außer Filament)
           bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
           bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
           bool err_hms   = id(hms_errors).has_state()   && id(hms_errors).state;
@@ -726,9 +757,11 @@ interval:
             return;
           }
           
-          // fertig = blau
-          bool finished = (prog >= 100) || (ps == "finish") || (ps.find("finish") != std::string::npos);
-          if (finished) {
+          // DONE strikt = blau
+          bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                              && (stage.find("idle") != std::string::npos)
+                              && (prog == 100));
+          if (done_strict) {
             lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0x00BFFF), LV_PART_MAIN);
             return;
           }
@@ -741,12 +774,12 @@ interval:
             } else if (prog > 0) {
               lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xFFFFFF), LV_PART_MAIN); // weiß (printing)
             } else {
-              lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xAAAAAA), LV_PART_MAIN); // grau (echtes idle)
+              lv_obj_set_style_text_color(id(lbl_status), lv_color_hex(0xAAAAAA), LV_PART_MAIN); // grau (idle)
             }
             return;
           }
           
-          // restliche Stages wie gehabt …
+          // restliche Stages
           if (stage.find("heatbed_preheating") != std::string::npos
            || stage.find("nozzle_preheating")  != std::string::npos
            || stage.find("preheat")            != std::string::npos
@@ -765,9 +798,15 @@ interval:
       - lvgl.label.update:
           id: lbl_remaining
           text: !lambda |-
+            auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
             int p = id(print_progress).has_state() ? (int) id(print_progress).state : 0;
-            std::string st = id(print_status).has_state() ? id(print_status).state : "";
-            if (p >= 100 || st.find("finish") != std::string::npos || st.find("done") != std::string::npos) {
+            if (p < 0) p = 0; if (p > 100) p = 100;
+            std::string ps = id(print_status).has_state() ? lower(id(print_status).state) : "";
+            std::string stg = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+            bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                                && (stg.find("idle") != std::string::npos)
+                                && (p == 100));
+            if (done_strict) {
               return std::string("Done");
             }
             if (id(remaining_time).has_state()) {
@@ -795,7 +834,7 @@ interval:
             lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 180);
           }
 
-         
+          
 
       - lvgl.label.update:
           id: lbl_layer
@@ -839,27 +878,34 @@ interval:
       - lambda: |-
           lv_obj_set_style_text_color(id(lbl_bed), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
 
-      # Farbe je nach "current_stage"/Status
+      # Farbe je nach "current_stage"/Status → Ziel-Farbe für den Printing-Blend
       - lambda: |-
           auto lower = [](std::string s){ for (auto &c : s) c = (char)tolower((unsigned char)c); return s; };
-          std::string s;
-          if (id(current_stage).has_state()) s = lower(id(current_stage).state);
-          if (s.empty() && id(print_status).has_state()) s = lower(id(print_status).state);
+          std::string stage = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+          std::string ps    = id(print_status).has_state()  ? lower(id(print_status).state)  : "";
+          int p = id(print_progress).has_state() ? (int) id(print_progress).state : id(last_prog);
+          if (p < 0) p = 0; if (p > 100) p = 100;
 
-          uint32_t col = 0x00FF00; // drucken
-          if (s.find("fertig") != std::string::npos || s.find("beendet") != std::string::npos
-              || s.find("finish") != std::string::npos || s.find("done") != std::string::npos) {
-            col = 0x00BFFF;        // fertig
-          } else if (s.find("heizbett") != std::string::npos || s.find("vorwärm") != std::string::npos
-               || s.find("wärm") != std::string::npos || s.find("reinig") != std::string::npos) {
+          // DONE strikt steuert NICHT den Printing-Blend (Ringfarbe wird oben gesetzt),
+          // aber wir halten die Ziel-Farbe konsistent
+          bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                              && (stage.find("idle") != std::string::npos)
+                              && (p == 100));
+
+          uint32_t col = 0x00FF00; // default: printing
+          if (done_strict) {
+            col = 0x00BFFF;        // fertig (nur wenn strikt)
+          } else if (stage.find("heatbed") != std::string::npos || stage.find("preheat") != std::string::npos
+                  || stage.find("nozzle_preheating") != std::string::npos) {
             col = 0xFF3333;        // aufheizen
-          } else if (s.find("abkühl") != std::string::npos || s.find("kühl") != std::string::npos) {
+          } else if (stage.find("clean") != std::string::npos) {
+            col = 0xFFFFFF;        // reinigen
+          } else if (stage.find("auto_bed_leveling") != std::string::npos || stage.find("bed_level") != std::string::npos) {
+            col = 0xFFA500;        // leveling
+          } else if (stage.find("cool") != std::string::npos) {
             col = 0x3399FF;        // abkühlen
-          } else if (s.find("automatische bettnivellierung") != std::string::npos || s.find("nivell") != std::string::npos) {
-            col = 0xFFA500;        // leveling/pausiert
-          } else if (s.find("pause") != std::string::npos) {
-            col = 0xFFA500;
-          } else if (s.find("leerlauf") != std::string::npos || s.find("idle") != std::string::npos || s.find("offline") != std::string::npos) {
-            col = 0x666666;        // idle
+          } else if (stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos) {
+            // echter idle nur wenn kein Job aktiv
+            col = ( (p > 0 && p < 100) || ps == "running" || ps == "prepare" ) ? 0x00FF00 : 0x666666;
           }
           id(ui_col_target) = col;
