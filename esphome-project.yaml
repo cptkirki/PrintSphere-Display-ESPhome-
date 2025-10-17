@@ -89,7 +89,7 @@ online_image:
     format: PNG
     type: RGB565
     resize: 420x420
-    placeholder: img_blank
+    placeholder: img_placeholder
     request_headers:
       Accept: image/png,image/jpeg;q=0.9,*/*;q=0.1
       Accept-Encoding: identity
@@ -171,7 +171,9 @@ image:
   - file: ${bambulab_icon}
     id: img_blank
     type: RGB565
-
+  - file: images/placeholder.png  # neutraler Platzhalter (z.B. schwarz/transparent)
+    id: img_placeholder
+    type: RGB565
 # ---------- QSPI ----------
 spi:
   - id: qspi_bus
@@ -228,7 +230,7 @@ lvgl:
   widgets:
     - image:
         id: img_preview
-        src: ha_preview
+        src: ha_preview    # <-- vorher: img_blank
         antialias: true
         radius: 12
     - image:
@@ -238,7 +240,7 @@ lvgl:
         radius: 8   
     - obj:
         id: img_mask
-        width: 420
+        width: 420         # passend zu online_image.resize
         height: 420
         radius: 210        # Kreis
         bg_opa: 0
@@ -290,17 +292,19 @@ lvgl:
         bg_opa: 0
         border_opa: 0
         pad_all: 0
+        width: 280
         layout:
           type: FLEX
           flex_flow: ROW
+          flex_align_main: CENTER
           flex_align_cross: CENTER
         widgets:
           - label:
               id: lbl_remaining_icon
-              text: "\U000F144E"       # mdiClockTimeFourOutline
+              text: "\U000F144E"
               text_font: font_mdi_40
               text_color: 0x87CEEB
-              pad_right: 8             # Abstand zum Text
+              pad_right: 8
           - label:
               id: lbl_remaining
               text: " --m"
@@ -382,29 +386,22 @@ interval:
           lv_obj_align(id(lbl_layer), LV_ALIGN_CENTER, 0, 70);  
 
           lv_obj_set_parent(id(row_remaining), page1);
-          lv_obj_set_width(id(row_remaining), LV_SIZE_CONTENT);
+          lv_obj_set_width(id(row_remaining), 280);                   // fix: keine dynamische Breite
           lv_obj_clear_flag(id(row_remaining), LV_OBJ_FLAG_SCROLLABLE);
-          lv_obj_update_layout(id(row_remaining));
           lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 180);
           lv_obj_move_foreground(id(row_remaining));
 
           // === Always-on: Nozzle & Bed frei platzierbar (unabhängig von Pages) ===
           // Parent auf Root-Screen
-          // --- kleines Logo (img_blank) zentriert auf Page 1 ---
+
+          // --- kleines Logo (natives 86x86 PNG) auf Page 1 ---
           lv_obj_set_parent(id(img_logo_small), page1);
-          {
-            int w = lv_obj_get_width(id(img_logo_small));
-            int h = lv_obj_get_height(id(img_logo_small));
-            if (w > 0 && h > 0) {
-              const int TARGET = 86;
-              int z = std::min((TARGET*256)/w, (TARGET*256)/h);
-              if (z > 256) z = 256;
-              if (z < 16)  z = 16;
-              lv_img_set_zoom(id(img_logo_small), z);
-            }
-          }
+          lv_img_set_zoom(id(img_logo_small), 256);  // 1.0x, nutzt native Größe
           lv_obj_align(id(img_logo_small), LV_ALIGN_CENTER, 0, -7);
-          
+          // Sicherheit: nie über den Text legen
+          lv_obj_move_background(id(img_logo_small));
+          lv_obj_clear_flag(id(img_logo_small), LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);     
+
           // === Nozzle & Bed NUR auf Page 1 ===
           lv_obj_set_parent(id(lbl_nozzle_icon), page1);
           lv_obj_set_parent(id(lbl_nozzle),      page1);
@@ -417,7 +414,6 @@ interval:
           const int BED_ICON_X    =  110, BED_ICON_Y    = -10;
           const int BED_TEXT_X    =  160, BED_TEXT_Y    = -10;
           
-          //Nozzle & Bed Icon and text
           lv_obj_align(id(lbl_nozzle_icon), LV_ALIGN_CENTER, NOZZLE_ICON_X, NOZZLE_ICON_Y);
           lv_obj_align(id(lbl_nozzle),      LV_ALIGN_CENTER, NOZZLE_TEXT_X, NOZZLE_TEXT_Y);
           lv_obj_align(id(lbl_bed_icon),    LV_ALIGN_CENTER, BED_ICON_X, BED_ICON_Y);
@@ -460,16 +456,66 @@ interval:
           
           // Auf Seite 1 starten
           lv_obj_scroll_to_view(page1, LV_ANIM_OFF);
-
+          
           // === Smooth scrolling: throttle heavy redraws during pager scroll ===
           lv_obj_add_event_cb(pager, [](lv_event_t* e){
+            using namespace esphome::lvgl;
+            const int W = 466;
+          
+            static bool p1_shown  = true;   // gemerkter Sichtbarkeitszustand
+            static bool init_done = false;
+          
+            auto set_page1_visible = [&](bool visible){
+              if (p1_shown == visible) return;  // Hysterese: nur toggeln, wenn nötig
+              for (auto o : { id(lbl_status), id(lbl_layer), id(row_remaining),
+                              id(lbl_nozzle_icon), id(lbl_nozzle),
+                              id(lbl_bed_icon),    id(lbl_bed),
+                              id(img_logo_small) }) {
+                if (visible) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+                else         lv_obj_add_flag(o,   LV_OBJ_FLAG_HIDDEN);
+              }
+              p1_shown = visible;
+            };
+          
             lv_event_code_t code = lv_event_get_code(e);
+          
             if (code == LV_EVENT_SCROLL_BEGIN) {
-              id(is_scrolling) = true; // throttle updates only
-            } else if (code == LV_EVENT_SCROLL_END || code == LV_EVENT_RELEASED) {
+              id(is_scrolling) = true;  // dein bestehendes Throttling nutzt das Flag
+            }
+          
+            if (code == LV_EVENT_SCROLL || code == LV_EVENT_SCROLL_BEGIN) {
+              // Wie weit wurde horizontal gerollt? 0 ~ Page1 zentriert, ~W ~ Page2 zentriert
+              int sx = lv_obj_get_scroll_x(lv_event_get_target(e));
+          
+              // Hysterese-Schwellen: stabil gegen Hin-und-Her um die Mitte
+              const int THRESH_HIDE = (int)(W * 0.60f);  // >60% Richtung Page2 ⇒ Page1-Widgets aus
+              const int THRESH_SHOW = (int)(W * 0.40f);  // <40% zurück ⇒ Page1-Widgets an
+          
+              if (sx > THRESH_HIDE)       set_page1_visible(false);
+              else if (sx < THRESH_SHOW)  set_page1_visible(true);
+          
+              if (!init_done) {           // einmalige Initialisierung (Start auf Page1)
+                set_page1_visible(true);
+                init_done = true;
+              }
+            }
+          
+            if (code == LV_EVENT_SCROLL_END || code == LV_EVENT_RELEASED) {
               id(is_scrolling) = false;
+          
+              // Nach Snap final „einrasten“: Page1 sichtbar, wenn deren Anteil dominiert
+              int sx = lv_obj_get_scroll_x(lv_event_get_target(e));
+              set_page1_visible(sx < (W/2));
             }
           }, LV_EVENT_ALL, nullptr);
+          {
+            for (auto o : { id(lbl_status), id(lbl_layer), id(row_remaining),
+                            id(lbl_nozzle_icon), id(lbl_nozzle),
+                            id(lbl_bed_icon),    id(lbl_bed),
+                            id(img_logo_small) }) {
+              lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+            }
+          }
 
           id(ui_built) = true;
 
@@ -821,19 +867,15 @@ interval:
             }
             return std::string("--m");
       - lambda: |-
-          // Farbe angleichen
+          // Farben konstant
           lv_obj_set_style_text_color(id(lbl_remaining),      lv_color_hex(0x87CEEB), LV_PART_MAIN);
           lv_obj_set_style_text_color(id(lbl_remaining_icon), lv_color_hex(0x87CEEB), LV_PART_MAIN);
-          
-          // Breite nach Inhalt + neu zentrieren (verhindert Abschneiden/Scrollen)
-          auto w_before = lv_obj_get_width(id(row_remaining));
-          lv_obj_set_width(id(row_remaining), LV_SIZE_CONTENT);
-          lv_obj_clear_flag(id(row_remaining), LV_OBJ_FLAG_SCROLLABLE);
-          lv_obj_update_layout(id(row_remaining));
-          auto w_after = lv_obj_get_width(id(row_remaining));
-          if (w_after != w_before) {
-            lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 180);
+
+          // FPS: keine dynamische Breite / kein Re-Layout während Scroll
+          if (lv_obj_get_width(id(row_remaining)) != 280) {
+            lv_obj_set_width(id(row_remaining), 280);
           }
+          lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 170);
 
           
 
