@@ -8,7 +8,7 @@ esphome:
   friendly_name: PrintSphere-Display
   min_version: 2025.9.0
   name_add_mac_suffix: false
-    
+
 esp32:
   variant: esp32s3
   framework:
@@ -18,16 +18,22 @@ psram:
   mode: octal
   speed: 80MHz
 
-logger:
-
 api:
+  encryption:
+    key: !secret api_encrypt
 
 ota:
   - platform: esphome
+    password: !secret ota_password
+
+logger:
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 10min
 
 globals:
   - id: ui_built
@@ -54,6 +60,70 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+
+time:
+  - platform: homeassistant
+    id: esptime
+
+http_request:
+  id: httpc
+  timeout: 10s
+  verify_ssl: false
+
+image:
+  - file: ${bambulab_icon}
+    id: img_bambu_logo
+    type: RGB565
+  - file: images/bambuicon.png  # neutraler Platzhalter (z.B. schwarz/transparent)
+    id: img_placeholder
+    type: RGB565
+# ---------- QSPI ----------
+spi:
+  - id: qspi_bus
+    type: quad
+    interface: spi3
+    clk_pin: GPIO10
+    data_pins: [GPIO11, GPIO12, GPIO13, GPIO14]
+
+# --- I²C (Touch) ---
+i2c:
+  - id: touch_i2c
+    sda: GPIO47
+    scl: GPIO48
+    scan: true
+    frequency: 400kHz
+
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    i2c_id: touch_i2c
+    address: 0x38
+    update_interval: 30ms
+    transform:
+      swap_xy: false
+      mirror_x: true
+      mirror_y: true
+
+# ---------- Display ----------
+display:
+  - platform: mipi_spi
+    model: CO5300
+    id: my_display
+    bus_mode: quad
+    cs_pin: GPIO9
+    reset_pin: GPIO21
+    brightness: 248
+    #transform:
+    #  swap_xy: true
+    #  mirror_x: true
+    #  mirror_y: true
+    dimensions:
+      height: 466
+      width: 466
+    data_rate: 80000000
+    spi_mode: MODE0
+    rotation: 180 # 270 when transform (90° rotation towards USB port)
+    invert_colors: false
 
 # ---------- HA-Entities ----------
 sensor:
@@ -158,69 +228,6 @@ binary_sensor:
     entity_id: binary_sensor.${bambulab_printer}_druckfehler
     internal: true
 
-time:
-  - platform: homeassistant
-    id: esptime
-
-http_request:
-  id: httpc
-  timeout: 10s
-  verify_ssl: false
-
-image:
-  - file: ${bambulab_icon}
-    id: img_blank
-    type: RGB565
-  - file: images/placeholder.png  # neutraler Platzhalter (z.B. schwarz/transparent)
-    id: img_placeholder
-    type: RGB565
-# ---------- QSPI ----------
-spi:
-  - id: qspi_bus
-    type: quad
-    interface: spi3
-    clk_pin: GPIO10
-    data_pins: [GPIO11, GPIO12, GPIO13, GPIO14]
-
-# --- I²C (Touch) ---
-i2c:
-  - id: touch_i2c
-    sda: GPIO47
-    scl: GPIO48
-    scan: true
-    frequency: 400kHz
-
-# ---------- Display ----------
-display:
-  - platform: mipi_spi
-    model: CO5300
-    id: my_display
-    bus_mode: quad
-    cs_pin: GPIO9
-    reset_pin: GPIO21
-    brightness: 248
-    #transform:
-    #  swap_xy: true
-    #  mirror_x: true
-    #  mirror_y: true
-    dimensions:
-      height: 466
-      width: 466
-    data_rate: 80000000
-    spi_mode: MODE0
-    rotation: 180 # 270 when transform (90° rotation towards USB port)
-    invert_colors: false
-
-touchscreen:
-  - platform: ft63x6
-    id: touch
-    i2c_id: touch_i2c
-    address: 0x38
-    update_interval: 20ms
-    transform:
-      swap_xy: false
-      mirror_x: true
-      mirror_y: false
 
 lvgl:
   id: ui
@@ -230,12 +237,12 @@ lvgl:
   widgets:
     - image:
         id: img_preview
-        src: ha_preview    # <-- vorher: img_blank
+        src: ha_preview  
         antialias: true
         radius: 12
     - image:
         id: img_logo_small
-        src: img_blank
+        src: img_bambu_logo
         antialias: true
         radius: 8   
     - obj:
@@ -316,23 +323,20 @@ font:
   - file: { type: gfonts, family: Dosis }
     id: font_dosis_20
     size: 20
-    glyphs:
-      - '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ '
-      - '°'
-  - file: { type: gfonts, family: Dosis }
-    id: font_dosis_24
-    size: 24
+    glyphs: '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ °-./_'
   - file: { type: gfonts, family: Dosis }
     id: font_dosis_32
     size: 32
+    glyphs: '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ °-./_'
   - file: { type: gfonts, family: Dosis }
     id: font_dosis_40
     size: 40
+    glyphs: '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ °-./_'
   - file: fonts/materialdesignicons-webfont.ttf
     id: font_mdi_40
     size: 40
     bpp: 4
-    glyphs: ["\U000F144E", "\U000F0E5B", "\U000F185B"]    # mdiClockTimeFourOutline
+    glyphs: ["\U000F144E", "\U000F0E5B", "\U000F185B"]  # mdiClockTimeFourOutline
 
 
 
@@ -388,7 +392,7 @@ interval:
           lv_obj_set_parent(id(row_remaining), page1);
           lv_obj_set_width(id(row_remaining), 280);                   // fix: keine dynamische Breite
           lv_obj_clear_flag(id(row_remaining), LV_OBJ_FLAG_SCROLLABLE);
-          lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 180);
+          lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 170);
           lv_obj_move_foreground(id(row_remaining));
 
           // === Always-on: Nozzle & Bed frei platzierbar (unabhängig von Pages) ===
@@ -519,7 +523,7 @@ interval:
 
           id(ui_built) = true;
 
-  - interval: 30ms
+  - interval: 50ms
     then:
       - lambda: |-
           using namespace esphome::lvgl;
