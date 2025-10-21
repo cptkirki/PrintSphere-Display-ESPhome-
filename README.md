@@ -10,6 +10,9 @@ A 🟢 ESP32-S3 display for Bambu Lab / Home Assistant print status:
 </p>
 
 ---
+⚠️⚠️⚠️
+Requires Home Assistant (running), the Bambu Lab integration, and a connected ESPHome device.
+⚠️⚠️⚠️
 
 ## Hardware
 
@@ -27,6 +30,7 @@ A 🟢 ESP32-S3 display for Bambu Lab / Home Assistant print status:
 - **LVGL** via the ESPHome `lvgl:` component
 - **Home Assistant** with Bambu Lab entities (see below) and network access  
   (`substitutions.homeassistant_url` must be reachable)
+- https://github.com/greghesp/ha-bambulab
 
 ---
 
