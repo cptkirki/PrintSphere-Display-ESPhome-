@@ -14,7 +14,7 @@ A 🟢 ESP32-S3 display for Bambu Lab / Home Assistant print status:
 ## Hardware
 
 - **ESP32-S3 Round AMOLED, 466×466**, Quad‑SPI display  
-  e.g., Waveshare Round AMOLED (CO5300 panel)  
+  e.g., Waveshare Round AMOLED (CO5300 panel) https://www.waveshare.com/esp32-s3-touch-amoled-1.43.htm 
   > In ESPHome configured as `display: platform: mipi_spi` with `bus_mode: quad`.
 - **Touch**: FT63x6 (I²C @ `0x38`)
 - 3d printable Case:
