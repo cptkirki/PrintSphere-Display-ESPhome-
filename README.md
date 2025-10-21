@@ -17,7 +17,8 @@ A 🟢 ESP32-S3 display for Bambu Lab / Home Assistant print status:
   e.g., Waveshare Round AMOLED (CO5300 panel)  
   > In ESPHome configured as `display: platform: mipi_spi` with `bus_mode: quad`.
 - **Touch**: FT63x6 (I²C @ `0x38`)
-
+3d printable Case:
+https://makerworld.com/de/models/1909685-printsphere-bambu-status-display-home-assistant
 ---
 
 ## Dependencies
