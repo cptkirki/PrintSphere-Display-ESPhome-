@@ -135,3 +135,20 @@ If this returns an image, ESP page 3 should work too.
   - token missing/invalid/expired
 - 404 on camera proxy:
   - wrong `ha_cam_entity_id` (or included `camera.` twice)
+ 
+## Setup HA Proxy Cam
+add the following to you configuration.yaml and restart HomeAssistant
+```bash
+# Example configuration.yaml entry
+camera:
+  - platform: proxy
+    entity_id: camera.p1s_01p00a546874654_camera (your BambuLab printer camera entity)
+    mode: resize
+    name: bigsphere_cam
+    max_image_width: 400
+    max_image_height: 225
+    max_stream_width: 400
+    max_stream_height: 225'
+
+  ```  
+
