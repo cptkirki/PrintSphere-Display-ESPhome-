@@ -1,3 +1,6 @@
+## https://github.com/cptkirki/PrintSphere-Display-ESPhome-/tree/Amoled-1.75
+## Bigger 1.75" screen version available now
+
 # PrintSphere-Display (ESPHome + LVGL, Round AMOLED)
 
 A 🟢 ESP32-S3 display for Bambu Lab / Home Assistant print status:
