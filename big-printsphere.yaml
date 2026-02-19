@@ -1,0 +1,2730 @@
+substitutions:
+  homeassistant_url: #Enter your HA adress: http://homeassistant.local:8123 or https://homeassistant.local:8443
+  bambulab_printer: #Enter your printer entity name from homeassistant
+  bambulab_icon: images/bambuicon.png
+  min_bri:    "0.05"   # wirkliches Minimum, wenn NICHT aus (5%)
+  dim_factor: "0.27"   # wie stark dimmen wir im Idle? (27% der User-Helligkeit)
+  ha_cam_entity_id: bigsphere_cam
+  touch_wake_inverted: "true"      # CST9217 INT ist meist active-low
+  touch_wakeup_pin_mode: KEEP_AWAKE  # Alternativen: IGNORE / INVERT_WAKEUP
+  axp2101_repo_url: https://github.com/cptkirki/AXP2101_WS-AMOLED-1.75
+  axp2101_repo_ref: v1.0.0
+
+esphome:
+  name: big-printsphere
+  friendly_name: big_PrintSphere
+  name_add_mac_suffix: false
+  platformio_options:
+    board_build.flash_mode: dio
+    board_build.f_flash: 80000000L
+    board_build.f_cpu: 240000000L
+    build_flags:
+      -D LV_DISP_DEF_REFR_PERIOD=12
+  on_boot:
+    priority: -50
+    then:
+      - lambda: |-
+          constexpr float MIN_BRI = ${min_bri}f;  // ~22 % Mindesthelligkeit
+          float bri = (float)id(user_brightness) / 255.0f;
+          if (bri < MIN_BRI) bri = MIN_BRI;
+
+          auto call = id(display_backlight).turn_on();
+          call.set_brightness(bri);
+          call.perform();
+
+          // Startzustand: nicht gedimmt, nicht "aus"
+          id(dimmed)     = false;
+          id(screen_off) = false;
+          
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+# Include external components
+external_components:
+  - source: 
+      type: git
+      url: https://github.com/shelson/esphome-cst9217
+  - source:
+      type: git
+      url: ${axp2101_repo_url}
+      ref: ${axp2101_repo_ref}
+    components: [axp2101]
+  # Local fallback (development only):
+  # - source: my_components
+  #   components: [axp2101]
+
+axp2101:
+  id: axp2101_component
+  model: WS-S3AMOLED175
+  address: 0x34
+  i2c_id: bus_a
+  update_interval: 1100ms  # Use 100ms for responsive power button detection
+
+
+http_request:
+  timeout: 10s
+  verify_ssl: false
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+api:
+  encryption:
+    key: !secret api_encrypt
+  reboot_timeout: 0s  
+  on_client_connected:
+    then:
+      - lambda: |-
+          if (id(api_clients) < 250) {
+            id(api_clients)++;
+          }
+          if (!id(wifi_is_off)) {
+            id(wifi_state) = 2;  // mindestens ein Client -> "connected"
+          }
+  on_client_disconnected:
+    then:
+      - lambda: |-
+          if (id(api_clients) > 0) {
+            id(api_clients)--;
+          }
+          // Nur wenn wirklich KEIN Client mehr verbunden ist, auf "connecting" zurückfallen
+          if (id(api_clients) == 0 && !id(wifi_is_off)) {
+            id(wifi_state) = 1;  // connecting
+          }
+  services:
+    - service: pmu_soft_power_off
+      then:
+        - lambda: |-
+            id(axp2101_component).soft_power_off_esp();
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  #level: WARN
+  
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: light   # statt none
+  reboot_timeout: 0s
+
+time:
+  - platform: homeassistant
+
+deep_sleep:
+  id: touch_deep_sleep
+  wakeup_pin:
+    number: GPIO11
+    allow_other_uses: true
+    mode: INPUT_PULLUP
+    inverted: ${touch_wake_inverted}
+  wakeup_pin_mode: ${touch_wakeup_pin_mode}
+
+i2c:
+  - id: bus_a
+    scl: GPIO14
+    sda: GPIO15
+    frequency: 400kHz
+    scan: false
+
+# NOT needed, we are using AXP2101 PKEY events
+#pca9554:
+#  - id: ioext
+#    address: 0x20
+#    i2c_id: bus_a
+
+# QSPI configuration for 1.75" AMOLED display
+spi:
+  - id: display_qspi
+    type: quad
+    clk_pin: GPIO38
+    data_pins:
+      - GPIO4
+      - GPIO5
+      - GPIO6
+      - GPIO7
+
+# Touchscreen Configuration
+touchscreen:
+  - platform: cst9217
+    display: main_display
+    id: touch
+    interrupt_pin:
+      number: GPIO11
+      allow_other_uses: true
+    reset_pin: GPIO40
+    transform:
+      mirror_x: true
+      mirror_y: true
+    on_touch:
+      then:
+        - script.stop: screen_idle_pipeline
+        - lambda: |-
+            // Interaktion -> Idle-Zeit / Ultra-Power zurücksetzen
+            id(last_touch_ms) = millis();
+            id(ultra_power) = false;
+            // Wenn WiFi vorher abgeschaltet war -> jetzt wieder einschalten
+            if (id(wifi_is_off)) {
+              id(wifi_is_off) = false;
+              id(wifi_turn_on).execute();
+            }
+    on_release:
+      - script.stop: screen_idle_pipeline   # Idle-Pipeline immer stoppen
+      - lambda: |-
+          id(last_touch_ms) = millis();
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - logger.log: "LVGL resuming from paused idle"
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+            - lambda: |-
+                constexpr float MIN_BRI = ${min_bri}f;
+                float bri = (float)id(user_brightness) / 255.0f;
+                if (bri < MIN_BRI) bri = MIN_BRI;
+
+                auto call = id(display_backlight).turn_on();
+                call.set_brightness(bri);
+                call.perform();
+
+                id(dimmed)     = false;
+                id(screen_off) = false;
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(dimmed);'
+                then:
+                  - logger.log: "LVGL still running, but was dimmed → restore brightness"
+                  - lambda: |-
+                      constexpr float MIN_BRI = ${min_bri}f;
+                      float bri = (float)id(user_brightness) / 255.0f;
+                      if (bri < MIN_BRI) bri = MIN_BRI;
+
+                      auto call = id(display_backlight).turn_on();
+                      call.set_brightness(bri);
+                      call.perform();
+
+                      id(dimmed)     = false;
+                      id(screen_off) = false;
+
+# 1.75" Round AMOLED Display Configuration (466x466 with CO5300 Driver)
+display:
+  - platform: mipi_spi
+    model: WAVESHARE-ESP32-S3-TOUCH-AMOLED-1.75
+    id: main_display
+    spi_id: display_qspi
+    data_rate: 80MHz
+    auto_clear_enabled: false # Recommended for LVGL
+    update_interval: never    # Recommended for most displays with LVGL
+    #buffer_size: 1.0
+
+globals:
+  - id: api_clients
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+  - id: wifi_state
+    type: uint8_t
+    restore_value: no
+    initial_value: "1"  # Boot: WiFi an & verbindet sich 
+  - id: wifi_is_off
+    type: bool
+    restore_value: no
+    initial_value: "false"  
+  - id: ui_built
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ui_col_now
+    type: uint32_t
+    restore_value: no
+    initial_value: "0x00FF00"
+  - id: ui_col_target
+    type: uint32_t
+    restore_value: no
+    initial_value: "0x00FF00"
+  - id: last_prog
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: print_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: is_scrolling
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: soc_estimate          # aktueller „optimistischer“ SoC in %
+    type: float
+    restore_value: yes
+    initial_value: "50.0"
+  - id: usb_present           # aktueller USB-Status
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: dimmed           # dimmed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: screen_off
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: user_brightness   # user_brightness
+    type: int
+    restore_value: yes
+    initial_value: "225"   # entspricht deiner bisherigen Max-Helligkeit
+  - id: ultra_power
+    type: bool
+    restore_value: no
+    initial_value: "false"
+#============== Globals FARBEN ======================
+  - id: col_ring_printing
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0x00FF00"   # Grün: Printing
+  - id: col_ring_done
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0x00FFFF"   # Blau: Done
+  - id: col_ring_error_hi
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0xFF3333"   # Hellrot: Error
+  - id: col_ring_idle
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0x666666"   # Grau: Idle / Offline
+  - id: col_ring_preheat
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0xFFA500"   # Orange: Preheat
+  - id: col_ring_clean
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0xFFFFFF"   # Weiß: Clean
+  - id: col_ring_level
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0xFFA500"   # Orange: Bed Level
+  - id: col_ring_cool
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0x3399FF"   # Hellblau: Cooling
+  - id: col_ring_idle_active
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0x00FF00"   # Grün: Job vorhanden, aber Stage idle/offline
+  - id: col_ring_filament
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0xFFD54F"   # Gelb: Filament load/unload
+  - id: charge_anim_running
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: charge_anim_start_ms
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: page3_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: touch_deep_sleep_enabled
+    type: bool
+    restore_value: yes
+    initial_value: "false"
+  - id: cam_fetch_in_flight
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: cam_fetch_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: cam_fetch_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: last_touch_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+script:
+  - id: wifi_turn_off
+    then:
+      - logger.log: "WiFi OFF (idle timeout)"
+      - lambda: |-
+          id(wifi_state) = 0;
+      - wifi.disable:
+  - id: wifi_turn_on
+    then:
+      - logger.log: "WiFi ON (touch wake)"
+      - lambda: |-
+          id(wifi_is_off) = false;
+          id(wifi_state)  = 1;  // erst mal "connecting"
+      - wifi.enable:
+  - id: publish_power_ha_now
+    then:
+      - component.update: batt_level_ha
+      - component.update: pmu_temp_ha
+  - id: wake_display_now
+    then:
+      - script.stop: screen_idle_pipeline
+      - lambda: |-
+          id(screen_off)  = false;
+          id(dimmed)      = false;
+          id(ultra_power) = false;
+          id(ui).set_paused(false, false);
+
+          constexpr float MIN_BRI = ${min_bri}f;
+          float bri = (float) id(user_brightness) / 255.0f;
+          if (bri < MIN_BRI) bri = MIN_BRI;
+
+          auto call = id(display_backlight).turn_on();
+          call.set_brightness(bri);
+          call.perform();
+      - lvgl.widget.redraw:
+  - id: screen_idle_pipeline
+    mode: restart
+    then:
+      - logger.log: "Idle Stage 1: dim display (LVGL idle)"
+      - lambda: |-
+          id(dimmed)      = true;
+          id(screen_off)  = false;
+          id(ultra_power) = false;
+
+          constexpr float MIN_BRI   = ${min_bri}f;
+          constexpr float DIM_FACT  = ${dim_factor}f;
+
+          float bri = (float)id(user_brightness) / 255.0f;
+          bri *= DIM_FACT; 
+          if (bri < MIN_BRI) bri = MIN_BRI;
+
+          auto call = id(display_backlight).turn_on();
+          call.set_brightness(bri);
+          call.perform();
+
+      # 15 Minuten später → komplett aus
+      - delay: 15min
+      - logger.log: "Idle Stage 2: backlight OFF + LVGL pause"
+      - light.turn_off: display_backlight
+      - lambda: |-
+          id(screen_off) = true;
+
+          // Optional: WiFi schlafen legen, wenn auf Akku und kein Druck aktiv
+          if (!id(usb_present) && !id(print_active) && !id(wifi_is_off)) {
+            id(wifi_is_off) = true;
+            id(wifi_turn_off).execute();
+          }
+      - if:
+          condition:
+            lambda: 'return id(touch_deep_sleep_enabled) && !id(usb_present) && !id(print_active);'
+          then:
+            - script.execute: enter_touch_deep_sleep
+          else:
+            - lvgl.pause:
+  - id: enter_touch_deep_sleep
+    then:
+      - logger.log: "Entering deep sleep (wake: touch INT GPIO11)"
+      - lambda: |-
+          id(dimmed)      = false;
+          id(screen_off)  = true;
+          id(ultra_power) = true;
+      - light.turn_off: display_backlight
+      - if:
+          condition:
+            lambda: 'return !id(wifi_is_off);'
+          then:
+            - lambda: |-
+                id(wifi_is_off) = true;
+                id(wifi_state)  = 0;
+            - wifi.disable:
+      - lvgl.pause:
+      - delay: 300ms
+      - deep_sleep.enter: touch_deep_sleep
+  - id: pwr_soft_toggle
+    then:
+      - lambda: |-
+          if (id(screen_off) || id(dimmed) || id(ultra_power)) {
+            // --- WAKE ---
+            ESP_LOGI("pwr_btn", "Soft-Wake");
+            id(wake_display_now).execute();
+
+            if (id(wifi_is_off)) {
+              id(wifi_is_off) = false;
+              id(wifi_state)  = 1;
+              id(wifi_turn_on).execute();
+            }
+          } else {
+            // --- SLEEP ---
+            ESP_LOGI("pwr_btn", "Soft-Sleep");
+            id(screen_idle_pipeline).stop();
+
+            // Flags VOR dem Ausschalten setzen, damit user_brightness nicht 0 wird
+            id(dimmed)      = false;
+            id(screen_off)  = true;
+            id(ultra_power) = true;
+
+            auto call = id(display_backlight).turn_off();
+            call.perform();
+
+            id(ui).set_paused(true, false);
+
+            if (!id(usb_present) && !id(print_active) && !id(wifi_is_off)) {
+              ESP_LOGI("pwr_btn", "Soft-Sleep: turning WiFi OFF");
+              id(wifi_is_off) = true;
+              id(wifi_state)  = 0;
+              id(wifi_turn_off).execute();
+            }
+            if (id(touch_deep_sleep_enabled) && !id(usb_present) && !id(print_active)) {
+              ESP_LOGI("pwr_btn", "Soft-Sleep -> Deep-Sleep (touch wake)");
+              id(enter_touch_deep_sleep).execute();
+            }
+          }
+
+image:
+  - file: ${bambulab_icon}
+    id: img_bambu_logo
+    type: RGB565
+  - file: images/bambuicon.png  # neutraler Platzhalter (z.B. schwarz/transparent)
+    id: img_placeholder
+    type: RGB565
+
+
+# ---------- HA-Entities ----------
+switch:
+  - platform: template
+    name: "PrintSphere: Dimmen beim Laden"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+  - platform: template
+    name: "PrintSphere: Deep Sleep via Touch"
+    lambda: |-
+      return id(touch_deep_sleep_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(touch_deep_sleep_enabled) = true;
+    turn_off_action:
+      - lambda: |-
+          id(touch_deep_sleep_enabled) = false;
+    entity_category: config
+
+output:
+  - platform: template
+    id: backlight_brightness
+    type: float
+    write_action:
+      then:
+        - lambda: |-
+            float val = state;  // 0.0–1.0 vom Light
+            // Hard-Minimum: nicht dunkler als min_bri, solange das Licht an ist
+            if (val > 0.0f && val < ${min_bri}f) {
+              val = ${min_bri}f;
+            }
+            if (val > 1.0f) val = 1.0f;
+
+            int hw_val = (int) lroundf(val * 255.0f);
+            if (hw_val < 0)   hw_val = 0;
+            if (hw_val > 255) hw_val = 255;
+
+            id(main_display).set_brightness(hw_val);
+
+            if (!id(screen_off) && !id(dimmed) && !id(ultra_power)) {
+              id(user_brightness) = hw_val;
+            }
+  - platform: template
+    id: out_printing_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;  // 0.0–1.0
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_printing);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_printing) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_printing_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_printing);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_printing) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_printing_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_printing);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_printing) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+# -------- DONE (col_ring_done) --------
+  - platform: template
+    id: out_done_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;  // 0.0–1.0
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_done);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_done) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_done_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_done);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_done) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_done_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_done);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_done) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- ERROR (col_ring_error_hi) --------
+  - platform: template
+    id: out_error_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_error_hi);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_error_hi) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_error_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_error_hi);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_error_hi) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_error_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_error_hi);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_error_hi) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- IDLE (col_ring_idle) --------
+  - platform: template
+    id: out_idle_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_idle);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_idle) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_idle_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_idle);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_idle) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_idle_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_idle);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_idle) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- PREHEAT (col_ring_preheat) --------
+  - platform: template
+    id: out_preheat_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_preheat);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_preheat) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_preheat_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_preheat);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_preheat) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_preheat_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_preheat);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_preheat) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- CLEAN (col_ring_clean) --------
+  - platform: template
+    id: out_clean_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_clean);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_clean) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_clean_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_clean);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_clean) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_clean_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_clean);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_clean) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- LEVEL (col_ring_level) --------
+  - platform: template
+    id: out_level_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_level);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_level) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_level_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_level);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_level) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_level_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_level);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_level) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- COOL (col_ring_cool) --------
+  - platform: template
+    id: out_cool_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_cool);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_cool) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_cool_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_cool);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_cool) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_cool_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_cool);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_cool) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- IDLE ACTIVE (col_ring_idle_active) --------
+  - platform: template
+    id: out_idle_active_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_idle_active);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_idle_active) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_idle_active_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_idle_active);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_idle_active) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  - platform: template
+    id: out_idle_active_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_idle_active);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_idle_active) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+  # -------- FILAMENT (col_ring_filament) --------
+  - platform: template
+    id: out_filament_r
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t r = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_filament);
+          uint8_t g = (col >> 8) & 0xFF;
+          uint8_t b =  col       & 0xFF;
+          id(col_ring_filament) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+
+  - platform: template
+    id: out_filament_g
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t g = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_filament);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t b =  col        & 0xFF;
+          id(col_ring_filament) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+
+  - platform: template
+    id: out_filament_b
+    type: float
+    write_action:
+      - lambda: |-
+          float s = state;
+          uint8_t b = (uint8_t) roundf(s * 255.0f);
+          uint32_t col = id(col_ring_filament);
+          uint8_t r = (col >> 16) & 0xFF;
+          uint8_t g = (col >> 8)  & 0xFF;
+          id(col_ring_filament) = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+
+light:
+  - platform: monochromatic
+    id: display_backlight
+    name: "Backlight"
+    output: backlight_brightness
+    gamma_correct: 1.0 
+    default_transition_length:
+      milliseconds: 500
+    initial_state:
+      brightness: 80%
+    restore_mode: RESTORE_AND_ON
+    on_turn_on:
+      - lambda: |-
+          // Jede Änderung am Light (z.B. HA-Slider) gilt als Aktivität
+          id(screen_off)    = false;
+          id(dimmed)        = false;
+          id(ultra_power)   = false;
+  - platform: rgb
+    name: "Farbe · Printing"
+    red: out_printing_r
+    green: out_printing_g
+    blue: out_printing_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Done"
+    red: out_done_r
+    green: out_done_g
+    blue: out_done_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Error"
+    red: out_error_r
+    green: out_error_g
+    blue: out_error_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Idle"
+    red: out_idle_r
+    green: out_idle_g
+    blue: out_idle_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Preheat"
+    red: out_preheat_r
+    green: out_preheat_g
+    blue: out_preheat_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Clean"
+    red: out_clean_r
+    green: out_clean_g
+    blue: out_clean_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Level"
+    red: out_level_r
+    green: out_level_g
+    blue: out_level_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Cool"
+    red: out_cool_r
+    green: out_cool_g
+    blue: out_cool_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Idle (Job aktiv)"
+    red: out_idle_active_r
+    green: out_idle_active_g
+    blue: out_idle_active_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+  - platform: rgb
+    name: "Farbe · Filament"
+    red: out_filament_r
+    green: out_filament_g
+    blue: out_filament_b
+    restore_mode: RESTORE_AND_ON
+    gamma_correct: 1.0
+    default_transition_length: 0s
+
+sensor:
+  - platform: axp2101
+    axp2101_id: axp2101_component
+    battery_voltage:
+      name: "Battery Voltage (raw)"
+      internal: true
+    battery_level:
+      id: axp_batt_level
+      name: "Battery Level (raw)"
+      internal: true
+    temperature:
+      id: axp_pmu_temp
+      name: "PMU Temperature (raw)"
+      internal: true
+  - platform: template
+    id: batt_level_ha
+    name: "big_printsphere_battery_level"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: 15s
+    lambda: |-
+      if (!id(axp_batt_level).has_state()) return NAN;
+      return id(axp_batt_level).state;
+  - platform: template
+    id: pmu_temp_ha
+    name: "PMU Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    state_class: measurement
+    device_class: temperature
+    update_interval: 30s
+    lambda: |-
+      if (!id(axp_pmu_temp).has_state()) return NAN;
+      return id(axp_pmu_temp).state;
+  - platform: homeassistant
+    id: print_progress
+    entity_id: sensor.${bambulab_printer}_print_progress
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            static bool job_active = false;
+            float p = id(print_progress).state;  // aktueller Fortschritt
+            // --- Job startet oder ESP kommt dazu, während Job läuft ---
+            if (!job_active && p > 0.5f) {
+              job_active = true;
+              ESP_LOGD("preview", "Neuer/aktiver Druck erkannt (progress=%.1f) -> Bild laden", p);
+              // aktuelle URL aus ha_img_url nehmen
+              std::string raw(id(ha_img_url).state.c_str());
+              if (raw.empty()) {
+                ESP_LOGW("preview", "ha_img_url leer, kann kein Bild laden");
+                return;
+              }
+              // Vollständige URL bauen (raw enthält "/api/image_proxy/...")
+              std::string full = std::string("${homeassistant_url}") + raw;
+              ESP_LOGD("preview", "set_url(%s)", full.c_str());
+              id(ha_preview).set_url(full.c_str());
+              id(ha_preview).update();
+            }
+            // --- Job offensichtlich beendet / abgebrochen ---
+            if (job_active && p <= 0.5f) {
+              job_active = false;
+              ESP_LOGD("preview", "Druck beendet oder gestoppt (progress=%.1f)", p);
+            }
+
+  - platform: homeassistant
+    id: nozzle_temp
+    entity_id: sensor.${bambulab_printer}_nozzle_temperature
+    internal: true
+  - platform: homeassistant
+    id: bed_temp
+    entity_id: sensor.${bambulab_printer}_bed_temperature
+    internal: true
+  - platform: homeassistant
+    id: remaining_time
+    entity_id: sensor.${bambulab_printer}_remaining_time
+    internal: true
+  - platform: homeassistant
+    id: current_layer
+    entity_id: sensor.${bambulab_printer}_current_layer
+    internal: true
+  - platform: homeassistant
+    id: total_layer
+    entity_id: sensor.${bambulab_printer}_total_layer_count
+    internal: true
+
+online_image:
+  - id: ha_preview
+    # Start-URL ist egal – wir überschreiben sie gleich via set_url
+    url: "http://127.0.0.1/blank.png"
+    format: PNG
+    type: RGB565
+    resize: 420x420
+    placeholder: img_placeholder
+    update_interval: 24h
+    request_headers:
+      Accept: image/png,image/jpeg;q=0.9,*/*;q=0.1
+      Accept-Encoding: identity
+    on_download_finished:
+      then:
+        - lambda: |-
+            using namespace esphome::lvgl;
+            // UI noch nicht gebaut? Dann nur still fertig werden, aber nichts zeichnen
+            if (!id(ui_built)) {
+              ESP_LOGD("preview", "download finished, but UI not built yet → skip render");
+              return;
+            }
+            // Wenn Bildschirm aus oder Ultra-Power aktiv → nichts rendern
+            if (id(screen_off) || id(ultra_power)) {
+              return;
+            }
+
+            // Bild zuweisen
+            lv_img_set_src(id(img_preview), id(ha_preview));
+
+            // Scroll/Touch sicher aus
+            lv_obj_set_scrollbar_mode(id(img_mask), LV_SCROLLBAR_MODE_OFF);
+            lv_obj_clear_flag(id(img_mask), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(id(img_preview), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+            // Hinweis ausblenden
+            lv_obj_add_flag(id(page2_note), LV_OBJ_FLAG_HIDDEN);
+
+            // Zoom zurücksetzen, dann Größe lesen
+            lv_img_set_zoom(id(img_preview), 256);  // 256 = 1.0x
+            int w = lv_obj_get_width(id(img_preview));
+            int h = lv_obj_get_height(id(img_preview));
+
+            if (w > 0 && h > 0) {
+              const int D = 420;
+              int z_w = (D * 256 + w - 1) / w;   // ceil(D/w)
+              int z_h = (D * 256 + h - 1) / h;   // ceil(D/h)
+              int z   = (z_w > z_h) ? z_w : z_h; // COVER
+
+              if (z < 16)   z = 16;
+              if (z > 1024) z = 1024;
+              lv_img_set_zoom(id(img_preview), z);
+            }
+
+            lv_obj_center(id(img_preview));
+            lv_obj_invalidate(id(img_preview));
+  - id: ha_cam
+    url: "http://127.0.0.1/blank.jpg"
+    format: JPEG
+    type: RGB565
+    resize: 400x225
+    placeholder: img_placeholder
+    update_interval: never
+    request_headers:
+      Authorization: !secret ha_auth_header
+      Accept: image/jpeg
+      Accept-Encoding: identity
+    on_download_finished:
+      then:
+        - lambda: |-
+            using namespace esphome::lvgl;
+            id(cam_fetch_in_flight) = false;
+            if (!id(ui_built)) return;
+            if (id(screen_off) || id(ultra_power)) return;
+            // WICHTIG: während Scroll oder wenn Page3 nicht aktiv -> NICHT rendern
+            if (id(is_scrolling) || !id(page3_active)) return;
+            lv_img_set_src(id(img_cam), id(ha_cam));
+            // Feed größer darstellen (ohne höhere Download-Last): in einen Zielbereich einpassen
+            lv_img_set_zoom(id(img_cam), 256);  // 1.0x
+            int w = lv_obj_get_width(id(img_cam));
+            int h = lv_obj_get_height(id(img_cam));
+            if (w > 0 && h > 0) {
+              const int TARGET_W = 440;
+              const int TARGET_H = 248;
+              int z_w = (TARGET_W * 256) / w;   // contain by width
+              int z_h = (TARGET_H * 256) / h;   // and max height
+              int z   = (z_w < z_h) ? z_w : z_h;
+              if (z < 64)   z = 64;
+              if (z > 1024) z = 1024;
+              lv_img_set_zoom(id(img_cam), z);
+            }
+            lv_obj_align(id(img_cam), LV_ALIGN_CENTER, 0, 30);
+            lv_obj_invalidate(id(img_cam));
+
+
+text_sensor:
+  - platform: homeassistant
+    id: current_stage
+    entity_id: sensor.${bambulab_printer}_current_stage
+    internal: true
+  - platform: homeassistant
+    id: print_status
+    entity_id: sensor.${bambulab_printer}_print_status
+    internal: true
+  - platform: homeassistant
+    id: ha_img_url
+    entity_id: image.${bambulab_printer}_titelbild
+    attribute: entity_picture
+    internal: true
+
+button:
+  - platform: template
+    name: "⚠️AXP2101 Reset Battery Stats"
+    on_press:
+      - lambda: |-
+          id(axp2101_component).reset_fuel_gauge_manual();
+
+binary_sensor:
+  - platform: axp2101
+    axp2101_id: axp2101_component
+    battery_charging:
+      name: "Battery Charging"
+    vbus_connected:
+      id: axp_vbus_connected
+      name: "USB Connected"
+    low_battery_level1:
+      name: "Low Battery Warning"
+      on_press:
+        - logger.log: "Low battery warning!"
+    low_battery_level2:
+      name: "Critical Battery Warning"
+      on_press:
+        - logger.log: "Critical battery!"
+    pkey_short_press:
+      name: "Power Button Short Press"
+      on_press:
+        - logger.log: "Power button short press!"
+        - script.execute: pwr_soft_toggle
+    pkey_long_press:
+      name: "Power Button Long Press"
+      on_press:
+        - logger.log: "Power button LONG press → pseudo power off via AXP2101"
+        - lambda: |-
+            id(axp2101_component).soft_power_off_esp();
+
+#    pkey_positive:
+#      name: "Power Button Pressed"
+#    pkey_negative:
+#      name: "Power Button Released"
+  - platform: homeassistant
+    id: hms_errors
+    entity_id: binary_sensor.${bambulab_printer}_hms_errors
+    internal: true
+  - platform: homeassistant
+    id: druckfehler
+    entity_id: binary_sensor.${bambulab_printer}_druckfehler
+    internal: true
+
+
+# ---- FONTS ----
+font:
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_20
+    size: 20
+    glyphs: '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ °-./_'
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_32
+    size: 32
+    glyphs: '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ °-./_'
+  - file: { type: gfonts, family: Dosis }
+    id: font_dosis_40
+    size: 40
+    glyphs: '0123456789:%abcdefghijklmnopqrstuvwxyzäöüABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ °-./_'
+  - file: fonts/materialdesignicons-webfont.ttf
+    id: font_mdi_40
+    size: 40
+    bpp: 4
+    glyphs: ["\U000F144E", "\U000F0E5B", "\U000F185B", "\U000F16C7"]  # mdiClockTimeFourOutline
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_30
+    size: 30
+    bpp: 4
+    glyphs: &mdi-battery-glyphs
+      # CHARGING (wireless)
+      - "\U000F0812"   # battery-charging-wireless-outline (0%)
+      - "\U000F0808"   # battery-charging-wireless-10
+      - "\U000F0809"   # battery-charging-wireless-20
+      - "\U000F080A"   # battery-charging-wireless-30
+      - "\U000F080B"   # battery-charging-wireless-40
+      - "\U000F080C"   # battery-charging-wireless-50
+      - "\U000F080D"   # battery-charging-wireless-60
+      - "\U000F080E"   # battery-charging-wireless-70
+      - "\U000F080F"   # battery-charging-wireless-80
+      - "\U000F0810"   # battery-charging-wireless-90
+      - "\U000F0807"   # battery-charging-wireless (100%)
+      # NORMAL BATTERY
+      - "\U000F10CD"   # battery-alert-variant-outline
+      - "\U000F007A"   # battery-10
+      - "\U000F007B"   # battery-20
+      - "\U000F007C"   # battery-30
+      - "\U000F007D"   # battery-40
+      - "\U000F007E"   # battery-50
+      - "\U000F007F"   # battery-60
+      - "\U000F0080"   # battery-70
+      - "\U000F0081"   # battery-80
+      - "\U000F0082"   # battery-90
+      - "\U000F0079"   # battery (100%)
+
+lvgl:
+  id: ui
+  color_depth: 16
+  displays: [main_display]
+  buffer_size: 1.0
+  touchscreens: [touch]
+  widgets:
+    - image:
+        id: img_preview
+        src: ha_preview  
+        antialias: true
+        radius: 12
+    - image:
+        id: img_logo_small
+        src: img_bambu_logo
+        antialias: true
+        radius: 8
+    - image:
+        id: img_cam
+        src: ha_cam
+        antialias: true
+        radius: 12
+    - obj:
+        id: img_mask
+        width: 420         # passend zu online_image.resize
+        height: 420
+        radius: 210        # Kreis
+        bg_opa: 0
+        border_opa: 0     
+    - obj:
+        width: 466
+        height: 466
+        align: center
+        bg_color: 0x000000
+        bg_opa: 0
+        border_opa: 0
+        # ---- PROGRESS RING ----
+    - arc:
+        id: arc_main
+        align: center
+        width: 466
+        height: 466
+        min_value: 0
+        max_value: 100
+        value: 0
+        rotation: 270
+        start_angle: 0
+        end_angle: 360
+        bg_opa: 0
+        border_opa: 0
+        pad_all: 0
+        arc_width: 24
+        arc_color: 0x101010
+        arc_rounded: true
+        indicator:
+          arc_width: 24
+          arc_color: 0x00FF00
+          arc_rounded: true
+    - spinner:
+        id: arc_sync
+        align: center
+        spin_time: 2s
+        arc_length: 60deg
+        width: 86
+        height: 86
+        bg_opa: 0
+        border_opa: 0
+        pad_all: 0
+        arc_width: 8
+        arc_color: 0x000000
+        arc_rounded: true
+        indicator:
+          arc_width: 8
+          arc_color: 0xFFFFFF
+          arc_rounded: true
+    # Sync-Icon (mdi-autorenew), wird rotiert
+    - label:
+        id: lbl_sync
+        text: "\U000F16C7"
+        text_color: 0xFFFFFF
+        text_font: font_mdi_40
+    # Batterie-Icon + Prozent im oberen Drittel
+    - label:
+        id: lbl_batt_icon
+        text: "\U000F0079"        # battery (placeholder)
+        text_color: 0xFFFFFF
+        text_font: font_mdi_30
+    - label:
+        id: lbl_bri_overlay
+        text: "80%"
+        text_font: font_dosis_40
+        text_color: 0xFFFFFF
+        bg_color: 0x000000
+        bg_opa: 96%          # halbtransparentes Schwarz
+    - label:
+        id: lbl_batt_pct
+        text: "--%"
+        text_color: 0xFFFFFF
+        text_font: font_dosis_20
+    # --- labels etc. (unchanged defs) ---
+    - label: { id: lbl_pct, text: "--%", align: center, x: 0, y: -170, text_color: 0xFFFFFF, text_font: font_dosis_40 }
+    - label: { id: lbl_layer, text: "Layer: -- / --", text_color: 0xDDDDDD, text_font: font_dosis_32 }
+    - label: { id: lbl_status, text: "Waiting for Data...", text_color: 0xFFFFFF, text_font: font_dosis_32 }
+    #- label: { id: lbl_remaining, text: "Rest: --m", text_color: 0x87CEEB, text_font: font_dosis_40 }
+    - label: { id: lbl_nozzle_icon, text: "\U000F0E5B", text_color: 0xFFFFFF, text_font: font_mdi_40 }
+    - label: { id: lbl_bed_icon,    text: "\U000F185B", text_color: 0xFFFFFF, text_font: font_mdi_40 }
+    - label: { id: lbl_nozzle, text: " --°C", text_color: 0xFFFFFF, text_font: font_dosis_32 }
+    - label: { id: lbl_bed,    text: " --°C", text_color: 0xFFFFFF, text_font: font_dosis_32 }
+    - label: { id: page2_note, text: "Preview deaktiviert", align: center, text_color: 0x888888, text_font: font_dosis_20 }
+    - obj:
+        id: row_remaining
+        bg_opa: 0
+        border_opa: 0
+        pad_all: 0
+        width: 280
+        layout:
+          type: FLEX
+          flex_flow: ROW
+          flex_align_main: CENTER
+          flex_align_cross: CENTER
+        widgets:
+          - label:
+              id: lbl_remaining_icon
+              text: "\U000F144E"
+              text_font: font_mdi_40
+              text_color: 0x87CEEB
+              pad_right: 8
+          - label:
+              id: lbl_remaining
+              text: " --m"
+              text_font: font_dosis_40
+              text_color: 0x87CEEB
+  on_idle:
+    timeout: 3min
+    then:
+      - logger.log: "LVGL idle → start screen_idle_pipeline"
+      - script.execute: screen_idle_pipeline
+
+# ---------- UI-Update ----------
+interval:
+  - interval: 300ms
+    then:
+      - lambda: |-
+          using namespace esphome::lvgl;
+          if (id(ui_built)) return;
+          if (lv_disp_get_default() == nullptr) return;
+
+          lv_obj_t* scr = lv_scr_act();
+
+          // black screen
+          lv_disp_set_theme(lv_disp_get_default(), nullptr);
+          lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
+          lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+
+          // pager with 3 pages
+          const int W = 466, H = 466;
+          lv_obj_t* pager = lv_obj_create(scr);
+          lv_obj_set_size(pager, W, H);
+          lv_obj_center(pager);
+          lv_obj_set_scroll_dir(pager, LV_DIR_HOR);
+          lv_obj_set_scroll_snap_x(pager, LV_SCROLL_SNAP_CENTER);
+          lv_obj_set_style_bg_opa(pager, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(pager, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_pad_all(pager, 0, LV_PART_MAIN);
+          lv_obj_set_scrollbar_mode(pager, LV_SCROLLBAR_MODE_OFF);
+
+          lv_obj_t* page1 = lv_obj_create(pager);
+          lv_obj_set_size(page1, W, H);
+          lv_obj_set_style_bg_opa(page1, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(page1, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_pos(page1, 0, 0);
+          
+          // page2
+          lv_obj_t* page2 = lv_obj_create(pager);
+          lv_obj_set_size(page2, W, H);
+          lv_obj_set_style_bg_opa(page2, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(page2, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_pos(page2, W, 0);
+
+          // page3
+          lv_obj_t* page3 = lv_obj_create(pager);
+          lv_obj_set_size(page3, W, H);
+          lv_obj_set_style_bg_opa(page3, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(page3, LV_OPA_TRANSP, LV_PART_MAIN);
+          lv_obj_set_pos(page3, 2*W, 0);
+
+          // Vertikales Scrollen der Pages komplett abschalten
+          lv_obj_clear_flag(page1, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_clear_flag(page2, LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_clear_flag(page3, LV_OBJ_FLAG_SCROLLABLE);
+
+          // page 1 content
+          lv_obj_set_parent(id(lbl_status), page1);
+          lv_obj_align(id(lbl_status), LV_ALIGN_CENTER, 0, -86);
+
+          lv_obj_set_parent(id(lbl_layer), page1);
+          lv_obj_align(id(lbl_layer), LV_ALIGN_CENTER, 0, 70);  
+
+          lv_obj_set_parent(id(row_remaining), page1);
+          lv_obj_set_width(id(row_remaining), 280);                   // fix: keine dynamische Breite
+          lv_obj_clear_flag(id(row_remaining), LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 190);
+          lv_obj_move_foreground(id(row_remaining));
+
+          // === Always-on: Nozzle & Bed frei platzierbar (unabhängig von Pages) ===
+          // Parent auf Root-Screen
+
+          // --- kleines Logo (natives 86x86 PNG) auf Page 1 ---
+          lv_obj_set_parent(id(img_logo_small), page1);
+          lv_img_set_zoom(id(img_logo_small), 256);  // 1.0x, nutzt native Größe
+          lv_obj_align(id(img_logo_small), LV_ALIGN_CENTER, 0, -7);
+          // Sicherheit: nie über den Text legen
+          lv_obj_move_background(id(img_logo_small));
+          lv_obj_clear_flag(id(img_logo_small), LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+          // --- kleiner Sync-Arc + Icon an gleicher Stelle wie Logo ---
+          lv_obj_set_parent(id(arc_sync), page1);
+          lv_obj_align(id(arc_sync), LV_ALIGN_CENTER, 0, -7);
+          lv_obj_clear_flag(id(arc_sync), LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+          lv_obj_set_parent(id(lbl_sync), page1);
+          lv_obj_align(id(lbl_sync), LV_ALIGN_CENTER, 0, -7);
+          lv_obj_clear_flag(id(lbl_sync), LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+          
+          // Standard: erst mal "connecting" → Arc + Icon sichtbar, Logo versteckt
+          lv_obj_add_flag(id(img_logo_small), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(lbl_sync), LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(id(arc_sync), LV_OBJ_FLAG_HIDDEN);
+
+          // === Nozzle & Bed NUR auf Page 1 ===
+          lv_obj_set_parent(id(lbl_nozzle_icon), page1);
+          lv_obj_set_parent(id(lbl_nozzle),      page1);
+          lv_obj_set_parent(id(lbl_bed_icon),    page1);
+          lv_obj_set_parent(id(lbl_bed),         page1);
+          
+          // Positionen wie gehabt (relativ zum Page-1-Zentrum)
+          const int NOZZLE_ICON_X = -182, NOZZLE_ICON_Y = -10;
+          const int NOZZLE_TEXT_X = -132, NOZZLE_TEXT_Y = -10;
+          const int BED_ICON_X    =  182, BED_ICON_Y    = -10;
+          const int BED_TEXT_X    =  108, BED_TEXT_Y    = -10;
+          
+          lv_obj_align(id(lbl_nozzle_icon), LV_ALIGN_CENTER, NOZZLE_ICON_X, NOZZLE_ICON_Y);
+          lv_obj_align(id(lbl_nozzle),      LV_ALIGN_CENTER, NOZZLE_TEXT_X, NOZZLE_TEXT_Y);
+          lv_obj_align(id(lbl_bed_icon),    LV_ALIGN_CENTER, BED_ICON_X, BED_ICON_Y);
+          lv_obj_align(id(lbl_bed),         LV_ALIGN_CENTER, BED_TEXT_X, BED_TEXT_Y);
+          lv_obj_set_width(id(lbl_bed), 96);  // fixed width prevents °C/text drifting into icon
+          lv_obj_set_style_text_align(id(lbl_bed), LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+
+          // main arc (immer oben)
+          lv_obj_set_parent(id(arc_main), lv_layer_top());
+          lv_obj_center(id(arc_main));
+          lv_obj_move_foreground(id(arc_main));
+          // sicherstellen, dass er keine Touches blockt
+          lv_obj_clear_flag(id(arc_main), LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+          
+          // %-Label (auch oben, damit es nie verdeckt wird)
+          const int RING_SIZE = 466;
+          const int PCT_MARGIN_FROM_TOP = 46;
+          lv_obj_set_parent(id(lbl_pct), lv_layer_top());
+          lv_obj_align(id(lbl_pct), LV_ALIGN_CENTER, 0, -(RING_SIZE/2 - PCT_MARGIN_FROM_TOP));
+          lv_obj_move_foreground(id(lbl_pct));
+
+          // Battery-Icon + Prozent im oberen Drittel unterhalb des Print-% 
+          lv_obj_set_parent(id(lbl_batt_icon), lv_layer_top());
+          lv_obj_set_parent(id(lbl_batt_pct),  lv_layer_top());
+
+          // Icon links, Prozent rechts
+          lv_obj_align(id(lbl_batt_icon), LV_ALIGN_CENTER, -20, -140);
+          lv_obj_align(id(lbl_batt_pct),  LV_ALIGN_CENTER,  20, -140);
+          //lv_obj_set_style_transform_zoom(id(lbl_batt_icon), 256, 0);
+          
+          lv_obj_move_foreground(id(lbl_batt_icon));
+          lv_obj_move_foreground(id(lbl_batt_pct));
+
+          // Brightness-Overlay mittig, standardmäßig versteckt
+          lv_obj_set_parent(id(lbl_bri_overlay), lv_layer_top());
+          lv_obj_align(id(lbl_bri_overlay), LV_ALIGN_CENTER, 0, 0);
+          lv_obj_set_style_bg_opa(id(lbl_bri_overlay), LV_OPA_60, LV_PART_MAIN);
+          lv_obj_set_style_pad_hor(id(lbl_bri_overlay), 20, LV_PART_MAIN);
+          lv_obj_set_style_pad_ver(id(lbl_bri_overlay), 10, LV_PART_MAIN);
+          lv_obj_set_style_radius(id(lbl_bri_overlay), 16, LV_PART_MAIN);
+          lv_obj_add_flag(id(lbl_bri_overlay), LV_OBJ_FLAG_HIDDEN);
+
+          // (Optional) Innerhalb von Page 1 die vier Labels nach vorn
+          for (auto obj : { id(lbl_nozzle_icon), id(lbl_nozzle), id(lbl_bed_icon), id(lbl_bed) }) {
+            lv_obj_move_foreground(obj);
+          }
+          // page 2
+          lv_obj_set_parent(id(page2_note), page2);
+          lv_obj_align(id(page2_note), LV_ALIGN_CENTER, 0, 0);
+          lv_obj_set_style_text_color(id(page2_note), lv_color_hex(0x888888), LV_PART_MAIN);
+          
+          // runde Maske als Parent
+          lv_obj_set_parent(id(img_mask), page2);
+          lv_obj_align(id(img_mask), LV_ALIGN_CENTER, 0, 0);
+          lv_obj_set_style_clip_corner(id(img_mask), true, LV_PART_MAIN);
+          lv_obj_set_scrollbar_mode(id(img_mask), LV_SCROLLBAR_MODE_OFF);
+          lv_obj_clear_flag(id(img_mask), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+          
+          // Bild in die Maske
+          lv_obj_set_parent(id(img_preview), id(img_mask));
+          lv_obj_center(id(img_preview));
+          lv_obj_clear_flag(id(img_preview), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+          // --- PAGE 3: Camera ---
+          lv_obj_set_parent(id(img_cam), page3);
+          // Swipe auf dem Bild soll zum Pager durch-bubblen
+          lv_obj_add_flag(id(img_cam), LV_OBJ_FLAG_GESTURE_BUBBLE);
+          lv_obj_add_flag(id(img_cam), LV_OBJ_FLAG_EVENT_BUBBLE);   
+
+          // Initial größer anzeigen; finaler Zoom wird nach jedem Download dynamisch gesetzt
+          lv_img_set_zoom(id(img_cam), 282);  // ~400 -> ~440 px
+          
+          // Position: mittig, leicht nach unten (damit oben Platz "luftig" bleibt)
+          lv_obj_align(id(img_cam), LV_ALIGN_CENTER, 0, 30);
+          
+          // Sicherheit: keine Touch/Scroll Events
+          lv_obj_clear_flag(id(img_cam), LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+          // Wichtig: Swipe soll an den Pager durchgereicht werden
+          lv_obj_add_flag(id(img_cam), LV_OBJ_FLAG_GESTURE_BUBBLE);
+          lv_obj_add_flag(id(img_cam), LV_OBJ_FLAG_EVENT_BUBBLE);
+          
+          // Extra robust: keine eigene Input-Verarbeitung vom Image
+          lv_obj_clear_flag(id(img_cam), LV_OBJ_FLAG_CLICK_FOCUSABLE);   
+                 
+          // Optional: runde Ecken nur optisch (du hast radius: 12 schon im Widget)
+          lv_obj_set_style_clip_corner(id(img_cam), true, LV_PART_MAIN);
+
+
+          // Auf Seite 1 starten
+          lv_obj_scroll_to_view(page1, LV_ANIM_OFF);
+          
+          // === Smooth scrolling: throttle heavy redraws during pager scroll ===
+          lv_obj_add_event_cb(pager, [](lv_event_t* e){
+            using namespace esphome::lvgl;
+            const int W = 466;
+          
+            auto set_page1_visible = [&](bool visible){
+              for (auto o : { id(lbl_status), id(lbl_layer), id(row_remaining),
+                              id(lbl_nozzle_icon), id(lbl_nozzle),
+                              id(lbl_bed_icon),    id(lbl_bed),
+                              id(img_logo_small),  id(lbl_sync), id(arc_sync) }) {
+                if (visible) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+                else         lv_obj_add_flag(o,   LV_OBJ_FLAG_HIDDEN);
+              }
+            };
+          
+            auto set_page2_visible = [&](bool visible){
+              for (auto o : { id(img_mask), id(img_preview), id(page2_note) }) {
+                if (visible) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+                else         lv_obj_add_flag(o,   LV_OBJ_FLAG_HIDDEN);
+              }
+            };
+          
+            auto set_page3_visible = [&](bool visible){
+              for (auto o : { id(img_cam) }) {
+                if (visible) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+                else         lv_obj_add_flag(o,   LV_OBJ_FLAG_HIDDEN);
+              }
+              id(page3_active) = visible;
+            };
+          
+            auto page_from_sx = [&](int sx)->int {
+              if (sx < (W/2)) return 0;
+              if (sx < (3*W)/2) return 1;
+              return 2;
+            };
+          
+            lv_event_code_t code = lv_event_get_code(e);
+          
+            // sx korrekt: NEGATIV -> positiv drehen
+            int sx_raw = lv_obj_get_scroll_x(lv_event_get_target(e));
+            int sx = sx_raw < 0 ? -sx_raw : sx_raw;   // Betrag
+            if (sx > 2*W) sx = 2*W;
+                      
+            if (code == LV_EVENT_SCROLL_BEGIN) {
+              id(is_scrolling) = true;
+              id(last_touch_ms) = millis();
+          
+              // Beim Scrollen: schwere Sachen aus, Kamera sofort deaktivieren
+              set_page1_visible(false);
+              set_page2_visible(false);
+              set_page3_visible(false);
+              return;
+            }
+          
+            if (code == LV_EVENT_SCROLL_END || code == LV_EVENT_RELEASED) {
+              id(is_scrolling) = false;
+              id(last_touch_ms) = millis();
+          
+              int p = page_from_sx(sx);
+              set_page1_visible(p == 0);
+              set_page2_visible(p == 1);
+              set_page3_visible(p == 2);
+              return;
+            }
+          
+            // Optional: während LV_EVENT_SCROLL NICHTS togglen -> maximal smooth
+          }, LV_EVENT_ALL, nullptr);
+          
+
+
+          {
+          // Startzustand: Page 1 sichtbar, Page 2 „schwere“ Widgets aus
+            for (auto o : { id(lbl_status), id(lbl_layer), id(row_remaining),
+                            id(lbl_nozzle_icon), id(lbl_nozzle),
+                            id(lbl_bed_icon),    id(lbl_bed),
+                            id(img_logo_small),  id(lbl_sync), id(arc_sync) }) {
+              lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+            }
+            for (auto o : { id(img_mask), id(img_preview), id(page2_note), id(img_cam) }) {
+              lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+          // --- Brightness-Geste: vertikaler Wisch überall auf dem Screen ---
+          lv_obj_add_event_cb(scr, [](lv_event_t * e){
+            using namespace esphome::lvgl;
+
+            static bool       bri_active = false;
+            static lv_coord_t start_y    = 0;
+            static int        start_bri  = 0;   // 0..255
+
+            lv_event_code_t code = lv_event_get_code(e);
+
+            // Wenn Display / LVGL "hart aus" → ignorieren
+            if (id(screen_off) || id(ultra_power)) {
+              return;
+            }
+
+            lv_indev_t * indev = lv_indev_get_act();
+            if (!indev) return;
+
+            lv_point_t p;
+            lv_indev_get_point(indev, &p);
+
+            if (code == LV_EVENT_PRESSED) {
+              bri_active = true;
+              start_y    = p.y;
+              start_bri  = id(user_brightness);
+
+              // Overlay initial befüllen
+              float pct_f = (float)start_bri * 100.0f / 255.0f;
+              if (pct_f < 0.0f)   pct_f = 0.0f;
+              if (pct_f > 100.0f) pct_f = 100.0f;
+              char buf[8];
+              snprintf(buf, sizeof(buf), "%d%%", (int)pct_f);
+              lv_label_set_text(id(lbl_bri_overlay), buf);
+              lv_obj_clear_flag(id(lbl_bri_overlay), LV_OBJ_FLAG_HIDDEN);
+
+            } else if (code == LV_EVENT_PRESSING && bri_active) {
+              // dy > 0 -> Finger nach oben -> heller
+              int dy = (int)(start_y - p.y);
+
+              // Empfindlichkeit: ca. 250 px ≈ kompletter Bereich 0..255
+              float delta_f = (float)dy * (255.0f / 250.0f);
+              int bri = start_bri + (int) lroundf(delta_f);
+              if (bri < 0)   bri = 0;
+              if (bri > 255) bri = 255;
+
+              id(user_brightness) = bri;
+
+              float bri_norm = (float)bri / 255.0f;
+              auto call = id(display_backlight).turn_on();
+              call.set_brightness(bri_norm);
+              call.perform();
+
+              int pct = (int) lroundf(bri_norm * 100.0f);
+              if (pct < 0)   pct = 0;
+              if (pct > 100) pct = 100;
+              char buf[8];
+              snprintf(buf, sizeof(buf), "%d%%", pct);
+              lv_label_set_text(id(lbl_bri_overlay), buf);
+
+            } else if ((code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) && bri_active) {
+              bri_active = false;
+              lv_obj_add_flag(id(lbl_bri_overlay), LV_OBJ_FLAG_HIDDEN);
+            }
+          }, LV_EVENT_ALL, nullptr);          
+          id(ui_built) = true;
+
+          // --- Initiales Preview-Laden nach UI-Build ---
+          if (id(ha_img_url).has_state()) {
+            std::string u = id(ha_img_url).state;
+
+            if (!u.empty()
+                && u.rfind("http://", 0) != 0
+                && u.rfind("https://", 0) != 0) {
+              u = std::string("${homeassistant_url}") + u;
+            }
+
+            if (!u.empty()) {
+              ESP_LOGD("preview", "UI built: initial load set_url(%s)", u.c_str());
+              id(ha_preview).set_url(u);
+              id(ha_preview).update();
+            }
+          }
+
+  - interval: 1s
+    then:
+
+      - lambda: |-
+          using namespace esphome::lvgl;
+          // *** EARLY-OUT beim Scrollen / Ultra / Screen-Off ***
+          if (id(is_scrolling) || id(ultra_power) || id(screen_off)) {
+            return;
+          }
+
+          // --- WiFi-Sync-Icon / Bambu-Logo steuern ---
+          {
+            uint8_t ws = id(wifi_state);  // 0=off, 1=connecting, 2=connected
+
+            if (ws == 2) {
+              // Verbunden: Bambu-Logo zeigen, Spinner weg
+              lv_obj_clear_flag(id(img_logo_small), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(lbl_sync),   LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(arc_sync),   LV_OBJ_FLAG_HIDDEN);
+            } else if (ws == 1) {
+              // WiFi an, verbindet sich: Spinner + Sync-Icon zeigen
+              lv_obj_add_flag(id(img_logo_small), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_clear_flag(id(lbl_sync),     LV_OBJ_FLAG_HIDDEN);
+              lv_obj_clear_flag(id(arc_sync),     LV_OBJ_FLAG_HIDDEN);
+              // KEINE Winkel-Updates mehr – das macht der Spinner intern!
+            } else {
+              // ws == 0 → WiFi aus: alles weg
+              lv_obj_add_flag(id(img_logo_small), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(lbl_sync),       LV_OBJ_FLAG_HIDDEN);
+              lv_obj_add_flag(id(arc_sync),       LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+          // Wenn Bildschirm komplett aus → keine weiteren UI-Updates
+          if (id(screen_off)) {
+            return;
+          }
+          // ===== NEU: Lade-Start Animation =====
+          if (id(charge_anim_running) && id(ui_built) && !id(screen_off)) {
+            const uint32_t DURATION = 4000;     // 4s insgesamt
+            const uint32_t SPAWN_MS = 140;      // alle 140ms ein Orb
+          
+            static uint32_t last_spawn = 0;
+          
+            uint32_t now_ms  = millis();
+            uint32_t start   = (uint32_t) id(charge_anim_start_ms);
+            uint32_t elapsed = now_ms - start;
+          
+            if (elapsed > DURATION) {
+              id(charge_anim_running) = false;
+            } else {
+              if (now_ms - last_spawn > SPAWN_MS) {
+                last_spawn = now_ms;
+          
+                // ---- Orb erzeugen ----
+                lv_obj_t *orb = lv_obj_create(lv_layer_top());
+                lv_obj_remove_style_all(orb);
+          
+                // GRÖSSER: 12x12 statt 8x8
+                lv_obj_set_size(orb, 12, 12);
+                lv_obj_set_style_radius(orb, LV_RADIUS_CIRCLE, 0);
+                lv_obj_set_style_bg_color(orb, lv_color_hex(0x6BFF91), 0);
+                lv_obj_set_style_bg_opa(orb, LV_OPA_COVER, 0);
+                lv_obj_set_style_shadow_width(orb, 10, 0);
+                lv_obj_set_style_shadow_color(orb, lv_color_hex(0x4CFF4C), 0);
+                lv_obj_set_style_shadow_opa(orb, LV_OPA_60, 0);
+          
+                // Start: um das Logo herum (Zentrum des Screens)
+                uint32_t r = now_ms * 1103515245u + 12345u;
+                int sx = (int)((int32_t)(r >> 16) % 40) - 20;   // -20..+19
+                int sy = (int)((int32_t)(r >> 8)  % 40) - 20;   // -20..+19
+          
+                // Ziel: Bereich um dein Battery-Icon (-20, -140)
+                // leicht breiter streuen, damit die Kurven variieren
+                int ex = -20 + (int)((int32_t)(r >> 4) % 26) - 13;   // -33..-7
+                int ey = -140 + (int)((int32_t)(r >> 2) % 18) - 9;   // -149..-131
+          
+                // Objekt initial positionieren (relative zum Screen-Center)
+                lv_obj_align(orb, LV_ALIGN_CENTER, sx, sy);
+          
+                // Kleine "curve": wir interpolieren in exec_cb selber
+                struct OrbPath {
+                  lv_obj_t *obj;
+                  lv_coord_t sx, sy, ex, ey;
+                };
+          
+                OrbPath *path = (OrbPath *) lv_mem_alloc(sizeof(OrbPath));
+                path->obj = orb;
+                path->sx  = sx;
+                path->sy  = sy;
+                path->ex  = ex;
+                path->ey  = ey;
+          
+                // Anim für Position + Opazität
+                lv_anim_t a;
+                lv_anim_init(&a);
+                lv_anim_set_var(&a, path);
+          
+                // LANGSAMER: ~650–1100ms Flight-Time
+                lv_anim_set_time(&a, 650 + (r % 450)); // 650–1100ms
+          
+                lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+                lv_anim_set_exec_cb(&a, [](void *var, int32_t v){
+                  OrbPath *p = (OrbPath *) var;
+          
+                  // v (0..255) → t (0..1)
+                  float t = v / 255.0f;
+                  if (t < 0.0f) t = 0.0f;
+                  if (t > 1.0f) t = 1.0f;
+          
+                  // Basis: lineare Interpolation von Start → Ziel
+                  float base_x = p->sx + (p->ex - p->sx) * t;
+                  float base_y = p->sy + (p->ey - p->sy) * t;
+          
+                  // Ausladendere Kurve: seitliche Sinus-Auslenkung
+                  const float PI = 3.14159265f;
+                  float phase    = t * PI;           // 0..π
+                  float curve_amp = 24.0f;          // Stärke der Auslenkung
+                  float curve     = curve_amp * sinf(phase);
+          
+                  // x stark, y leicht mitverbiegen → S-förmige / Seifenblasen-Kurve
+                  float fx = base_x + curve;
+                  float fy = base_y - curve * 0.3f;
+          
+                  lv_obj_align(p->obj, LV_ALIGN_CENTER,
+                               (lv_coord_t)fx, (lv_coord_t)fy);
+          
+                  // leichtes Ein-/Ausblenden, aber weicher
+                  float alpha;
+                  if (t < 0.25f) {
+                    alpha = t / 0.25f;         // 0 → 0.25 → 0 → 1
+                  } else if (t > 0.8f) {
+                    alpha = (1.0f - t) / 0.2f; // 0.8 → 1.0 → 1 → 0
+                  } else {
+                    alpha = 1.0f;
+                  }
+                  if (alpha < 0.0f) alpha = 0.0f;
+                  if (alpha > 1.0f) alpha = 1.0f;
+          
+                  uint8_t opa = (uint8_t)(alpha * 255.0f);
+                  lv_obj_set_style_bg_opa(p->obj, opa, 0);
+                  lv_obj_set_style_shadow_opa(p->obj, opa * 3 / 4, 0);
+                });
+                lv_anim_set_values(&a, 0, 255);
+                // Beim Ende: Zoom-Flash im Battery-Icon + Orb löschen
+                lv_anim_set_deleted_cb(&a, [](lv_anim_t *anim){
+                  OrbPath *p = (OrbPath *) anim->var;
+                
+                  // kurzer Farb-Flash des Batterie-Icons (Grün → Weiß zurück)
+                  lv_anim_t flash;
+                  lv_anim_init(&flash);
+                  lv_anim_set_var(&flash, id(lbl_batt_icon));
+                  lv_anim_set_time(&flash, 140);       // ~0,14 s
+                  lv_anim_set_values(&flash, 0, 255);
+                  lv_anim_set_exec_cb(&flash, [](void *v, int32_t val){
+                    lv_obj_t *icon = (lv_obj_t *) v;
+                    float t = val / 255.0f;
+                
+                    // Farbmix von "Energiegrün" zu Weiß
+                    auto mix = [](uint32_t c1, uint32_t c2, float t) {
+                      uint8_t r1 = (c1 >> 16) & 0xFF;
+                      uint8_t g1 = (c1 >>  8) & 0xFF;
+                      uint8_t b1 =  c1        & 0xFF;
+                      uint8_t r2 = (c2 >> 16) & 0xFF;
+                      uint8_t g2 = (c2 >>  8) & 0xFF;
+                      uint8_t b2 =  c2        & 0xFF;
+                      uint8_t r  = (uint8_t)(r1 + (r2 - r1) * t);
+                      uint8_t g  = (uint8_t)(g1 + (g2 - g1) * t);
+                      uint8_t b  = (uint8_t)(b1 + (b2 - b1) * t);
+                      return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                    };
+                
+                    uint32_t start_col = 0x6BFF91;  // helles grün
+                    uint32_t end_col   = 0xFFFFFF;  // weiß
+                    uint32_t col       = mix(start_col, end_col, t);
+                    lv_obj_set_style_text_color(icon, lv_color_hex(col), 0);
+                  });
+                  lv_anim_start(&flash);
+                
+                  // Orb zerstören + Path freigeben
+                  lv_obj_del(p->obj);
+                  lv_mem_free(p);
+                });
+                lv_anim_start(&a);
+              }
+            }
+          }
+
+          // Wenn wir im Ultra-Power-Modus sind:
+          if (id(ultra_power)) {
+            return;
+          }
+          // Während Scroll keine schweren UI-Updates ***
+          if (id(is_scrolling)) {
+            // Helligkeit & Orbs haben wir oben schon gemacht.
+            return;
+          }
+
+          // ---- helpers ----
+          auto lerp8 = [&](uint8_t a,uint8_t b,float t)->uint8_t { return (uint8_t) lroundf(a + (b-a)*t); };
+          auto pulse_between = [&](uint32_t lo,uint32_t hi,uint32_t period_ms)->uint32_t {
+            const float PI=3.14159265f;
+            float s = 0.5f + 0.5f * sinf((millis() % period_ms) * 2.0f * PI / period_ms);
+            uint8_t lr=(lo>>16)&0xFF, lg=(lo>>8)&0xFF, lb= lo     &0xFF;
+            uint8_t hr=(hi>>16)&0xFF, hg=(hi>>8)&0xFF, hb= hi     &0xFF;
+            return ((uint32_t)lerp8(lr,hr,s)<<16) | ((uint32_t)lerp8(lg,hg,s)<<8) | lerp8(lb,hb,s);
+          };
+          auto set_ring = [&](uint32_t main_col, uint32_t ind_col){
+            lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(main_col), LV_PART_MAIN);
+            lv_obj_set_style_arc_color(id(arc_main), lv_color_hex(ind_col),  LV_PART_INDICATOR);
+          };
+
+          // Smooth-Blend für Normalzustand
+          auto step_to = [](uint8_t cur, uint8_t tgt, uint8_t step)->uint8_t {
+            int d = (int)tgt - (int)cur;
+            if (d>0) return (uint8_t)(cur + std::min(d,(int)step));
+            if (d<0) return (uint8_t)(cur - std::min(-d,(int)step));
+            return cur;
+          };
+          const uint8_t STEP = 25;
+          uint32_t c_now = id(ui_col_now);
+          uint32_t c_tgt = id(ui_col_target);
+          uint8_t rn=(c_now>>16)&0xFF, gn=(c_now>>8)&0xFF, bn=c_now&0xFF;
+          uint8_t rt=(c_tgt>>16)&0xFF, gt=(c_tgt>>8)&0xFF, bt=c_tgt&0xFF;
+          uint8_t r = step_to(rn, rt, STEP);
+          uint8_t g = step_to(gn, gt, STEP);
+          uint8_t b = step_to(bn, bt, STEP);
+          uint32_t mixed = ((uint32_t)r<<16)|((uint32_t)g<<8)|b;
+
+          // Texte + Progress holen
+          auto lower = [](std::string s){ for(auto &c:s) c=(char)tolower((unsigned char)c); return s; };
+          std::string stage = id(current_stage).has_state() ? lower(id(current_stage).state) : "";
+          std::string ps    = id(print_status).has_state()  ? lower(id(print_status).state)  : "";
+          int prog = id(print_progress).has_state() ? (int) id(print_progress).state : id(last_prog);
+          if (prog < 0) prog = 0;
+          if (prog > 100) prog = 100;
+
+          // 1) FILAMENT loading/unloading – hat Prio
+          bool is_loading   = stage.find("filament_loading")   != std::string::npos;
+          bool is_unloading = stage.find("filament_unloading") != std::string::npos;
+          if (is_loading || is_unloading) {
+            uint32_t base   = 0x101010;             // dunkler Hintergrundring
+            uint32_t accent = id(col_ring_filament); // aus HA konfigurierbar
+            set_ring(base, accent);
+          
+            const uint32_t T_FILL_MS=2000U, T_HOLD_MS=300U, CYCLE=T_FILL_MS+T_HOLD_MS;
+            uint32_t t = millis() % CYCLE;
+            int value;
+            if (t < T_FILL_MS) {
+              float f = (float)t / (float)T_FILL_MS;
+              value = is_loading ? (int)lroundf(f*100.f) : (int)lroundf((1.f - f)*100.f);
+            } else value = is_loading ? 100 : 0;
+            lv_arc_set_value(id(arc_main), value);
+            return;
+          }
+
+          // 2) Fehler
+          bool err_hms   = id(hms_errors).has_state()  && id(hms_errors).state;
+          bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
+          bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
+          bool fatal_err =
+              ps_failed
+           || err_print
+           || (err_hms && !id(print_active));
+          
+          if (fatal_err) {
+            uint32_t c = pulse_between(0x220000, id(col_ring_error_hi), 1600);
+            set_ring(c, c);
+            return;
+          }
+          
+          // 3) DONE (strikt): ps=finish & stage=idle & prog=100
+          bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                              && (stage.find("idle") != std::string::npos)
+                              && (prog == 100));
+          if (done_strict) { set_ring(id(col_ring_done), id(col_ring_done)); return; }
+
+          // 4) Idle/Offline, aber NICHT fertig → wie printing/preparing
+          bool idleish = stage.find("idle") != std::string::npos || stage.find("offline") != std::string::npos;
+          if (idleish) {
+            if (ps == "prepare") {
+              uint32_t c = pulse_between(0x3A1F00, id(col_ring_preheat), 1400);
+              set_ring(c, c);
+              return;
+            }
+            if (id(print_active) || (prog > 0 && prog < 100)) {
+              id(ui_col_now) = mixed;
+              set_ring(0x101010, mixed);   
+              return;
+            }
+            set_ring(0x404040, 0x404040);  
+            return;
+          }
+
+          // 5) weitere Stages
+          if (stage.find("heatbed_preheating") != std::string::npos
+           || stage.find("nozzle_preheating")  != std::string::npos
+           || stage.find("preheat")            != std::string::npos) {
+            uint32_t c = pulse_between(0x3A1F00, id(col_ring_preheat), 1400); set_ring(c, c); return;
+          }
+          if (stage.find("cleaning_nozzle_tip") != std::string::npos
+           || stage.find("clean")               != std::string::npos) {
+            uint32_t c = pulse_between(0x404040, id(col_ring_clean), 1200); set_ring(c, c); return;
+          }
+          if (stage.find("auto_bed_leveling") != std::string::npos
+           || stage.find("bed_level")         != std::string::npos) {
+            uint32_t c = pulse_between(0x220033, id(col_ring_level), 1400); set_ring(c, c); return;
+          }
+
+          // 6) Default (Printing)
+          id(ui_col_now) = mixed;
+          set_ring(0x101010, mixed);
+
+ # Daten & Status
+  - interval: 1s
+    then:
+      - lambda: |-
+          // --- SoC direkt aus AXP (raw) ---
+          if (id(axp_batt_level).has_state()) {
+            float soc_raw = id(axp_batt_level).state;
+            if (soc_raw < 0.0f) soc_raw = 0.0f;
+            if (soc_raw > 100.0f) soc_raw = 100.0f;
+            id(soc_estimate) = soc_raw;
+          }
+          float soc = id(soc_estimate);
+
+          // --- USB-Status (VBUS) vom AXP2101 ---
+          bool usb_now = false;
+          if (id(axp_vbus_connected).has_state()) {
+            usb_now = id(axp_vbus_connected).state;
+          }
+
+          // Rising/Falling Edge anhand usb_present erkennen
+          if (usb_now && !id(usb_present)) {
+            // USB wurde gerade eingesteckt
+            id(usb_present) = true;
+            id(publish_power_ha_now).execute();
+
+            // Idle-Timer resetten & Display sauber aufwecken
+            id(wake_display_now).execute();
+
+            // Lade-Start-Animation triggern
+            id(charge_anim_running)  = true;
+            id(charge_anim_start_ms) = (int) millis();
+
+            ESP_LOGD("power", "USB eingesteckt → wake display, SoC=%.1f%%", soc);
+
+          } else if (!usb_now && id(usb_present)) {
+            // USB wurde abgezogen
+            id(usb_present) = false;
+            id(publish_power_ha_now).execute();
+
+            // Display ebenfalls sauber aufwecken
+            id(wake_display_now).execute();
+
+            ESP_LOGD("power", "USB abgezogen → wake display, SoC=%.1f%%", soc);
+          }
+ 
+      # --------- Variante B: ALLE UI-Updates in einer Lambda ---------
+      - lambda: |-
+          using namespace esphome::lvgl;
+
+          // ===== Helper-Funktionen =====
+          auto lower = [](std::string s){
+            for (auto &c : s) c = (char)tolower((unsigned char)c);
+            return s;
+          };
+          auto titlecase = [](std::string s)->std::string {
+            for (auto &ch : s) if (ch=='_' || ch=='-') ch=' ';
+            bool cap=true; 
+            for (auto &ch : s){
+              if (cap && isalpha((unsigned char)ch)) { ch=(char)toupper((unsigned char)ch); cap=false; }
+              else if (ch==' ') cap=true;
+              else ch=(char)tolower((unsigned char)ch);
+            }
+            std::string out; out.reserve(s.size()); bool sp=false;
+            for(char ch: s){
+              if(ch==' '){ if(!sp){out.push_back(' '); sp=true;} }
+              else { out.push_back(ch); sp=false; }
+            }
+            return out;
+          };
+          auto shorten = [&](std::string s, size_t n)->std::string {
+            if (s.size()<=n) return s;
+            return n<=3 ? s.substr(0,n) : s.substr(0,n-3)+"...";
+          };
+
+          auto clamp_pct = [](float p)->float {
+            if (isnan(p)) return NAN;
+            if (p < 0.0f) p = 0.0f;
+            if (p > 100.0f) p = 100.0f;
+            return p;
+          };
+
+          // ===== HARD SLEEP: im Ultra-Power-Modus gar keine LVGL-Updates mehr =====
+          if (id(ultra_power)) {
+            // Optional: du könntest hier noch gezielt was ausblenden, aktuell nur "freeze"
+            return;
+          }
+          // Während Scroll-Geste auch hier nichts anfassen ***
+          if (id(is_scrolling)) {
+            return;
+          }
+          // ===== Basiswerte/State holen =====
+          // Progress lesen + puffern
+          int prog = id(print_progress).has_state() ? (int) id(print_progress).state : id(last_prog);
+          if (prog < 0) prog = 0;
+          if (prog > 100) prog = 100;
+          if (id(print_progress).has_state()) id(last_prog) = prog;
+
+          std::string ps  = id(print_status).has_state()   ? lower(id(print_status).state)   : "";
+          std::string stg = id(current_stage).has_state()  ? lower(id(current_stage).state)  : "";
+
+          bool ps_failed = (ps == "failed") || (ps.find("fail") != std::string::npos);
+          bool err_print = id(druckfehler).has_state() && id(druckfehler).state;
+          bool err_hms   = id(hms_errors).has_state()   && id(hms_errors).state;
+
+          bool done_strict = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                              && (stg.find("idle") != std::string::npos)
+                              && (prog == 100));
+
+          bool running_like =
+              (ps == "running") ||
+              (ps == "prepare") ||
+              (ps.find("print") != std::string::npos) ||
+              (prog > 0 && prog < 100);
+
+          // vorheriger Zustand merken
+          bool prev_active = id(print_active);
+
+          // Aktiv-Flag setzen
+          if (ps_failed || done_strict) {
+            id(print_active) = false;
+          } else if (running_like) {
+            id(print_active) = true;
+          } else {
+            id(print_active) = false;
+          }
+
+          bool now_active = id(print_active);
+          // HMS nur als "fatal" werten, wenn kein aktiver Druck mehr läuft
+          bool fatal_err = ps_failed || err_print || (err_hms && !now_active);
+          // reine HMS-Warnung während aktiven Drucks
+          bool warn_hms  = err_hms && now_active;
+
+          // === Übergang: IDLE → PRINTING ===
+          if (!prev_active && now_active) {
+            ESP_LOGD("preview", "print started → wake display");
+
+            // Display aufwecken
+            id(wake_display_now).execute();
+          
+            // KEIN set_url()/update hier mehr!
+            // Das Bild wird
+            //   - beim Boot einmalig geladen (UI built: initial load)
+            //   - und bei jedem neuen entity_picture via ha_img_url.on_value neu gezogen.
+          }
+          
+          // Solange aktiv gedruckt wird → Ultra-Power verlassen
+          if (now_active) {
+            id(ultra_power) = false;
+          }
+
+          // ===== ARC-Wert setzen (Progress) inkl. Filament-Spezialfall =====
+          {
+            int arc_val = 0;
+            bool filament_loading   = stg.find("filament_loading")   != std::string::npos;
+            bool filament_unloading = stg.find("filament_unloading") != std::string::npos;
+
+            if (filament_loading || filament_unloading) {
+              // während der Filament-Animation Arc nicht anfassen → Wert beibehalten
+              arc_val = (int) lv_arc_get_value(id(arc_main));
+            } else if (id(print_progress).has_state()) {
+              int p = (int) id(print_progress).state;
+              if (p < 0) p = 0;
+              if (p > 100) p = 100;
+              arc_val = p;
+            } else {
+              arc_val = 0;
+            }
+            lv_arc_set_value(id(arc_main), arc_val);
+          }
+
+          // ===== % Label (Print-Fortschritt) =====
+          {
+            char buf[16];
+            if (id(print_progress).has_state()) {
+              snprintf(buf, sizeof(buf), "%d%%", (int) id(print_progress).state);
+            } else {
+              snprintf(buf, sizeof(buf), "--%%");
+            }
+            lv_label_set_text(id(lbl_pct), buf);
+            lv_obj_set_style_text_color(id(lbl_pct), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          }
+
+          // ===== Battery-Prozent unter dem Print-% =====
+          {
+            float p = id(soc_estimate);
+            if (isnan(p)) {
+              lv_label_set_text(id(lbl_batt_pct), "--%");
+            } else {
+              p = clamp_pct(p);
+              char buf[8];
+              snprintf(buf, sizeof(buf), "%.0f%%", p);
+              lv_label_set_text(id(lbl_batt_pct), buf);
+            }
+            lv_obj_set_style_text_color(id(lbl_batt_pct), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          }
+
+          // ===== Battery-Icon =====
+          {
+            bool usb = id(usb_present);
+            float p  = clamp_pct(id(soc_estimate));
+
+            if (usb) {
+              static uint32_t last_tick = 0;
+              static int      anim_step = 0;   // Offset in 10%-Steps
+
+              uint32_t now = millis();
+              const uint32_t STEP_MS = 1000;   // 1 s pro 10%-Icon
+
+              if (now - last_tick > STEP_MS) {
+                last_tick = now;
+                anim_step++;
+              }
+
+              if (isnan(p)) p = 0.0f;
+              int bucket = (int)(p / 10.0f);   // z.B. 37% → 3 (30%)
+              if (bucket < 0)  bucket = 0;
+              if (bucket > 10) bucket = 10;
+
+              int max_steps = 10 - bucket;
+              if (max_steps < 0) max_steps = 0;
+
+              if (anim_step > max_steps) {
+                anim_step = 0;
+              }
+
+              int level = bucket + anim_step;  // 0..10 → 0%,10%,...,100%
+
+              const char* glyph = "\U000F0807";
+              switch (level) {
+                case 0:  glyph = "\U000F0812"; break; // outline
+                case 1:  glyph = "\U000F0808"; break;
+                case 2:  glyph = "\U000F0809"; break;
+                case 3:  glyph = "\U000F080A"; break;
+                case 4:  glyph = "\U000F080B"; break;
+                case 5:  glyph = "\U000F080C"; break;
+                case 6:  glyph = "\U000F080D"; break;
+                case 7:  glyph = "\U000F080E"; break;
+                case 8:  glyph = "\U000F080F"; break;
+                case 9:  glyph = "\U000F0810"; break;
+                default: glyph = "\U000F0807"; break;
+              }
+              lv_label_set_text(id(lbl_batt_icon), glyph);
+            } else {
+              if (isnan(p)) {
+                lv_label_set_text(id(lbl_batt_icon), "\U000F10CD");   // Alert
+              } else if (p < 10.0f)        lv_label_set_text(id(lbl_batt_icon), "\U000F10CD"); // Alert
+              else if (p < 20.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F007A");
+              else if (p < 30.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F007B");
+              else if (p < 40.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F007C");
+              else if (p < 50.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F007D");
+              else if (p < 60.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F007E");
+              else if (p < 70.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F007F");
+              else if (p < 80.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F0080");
+              else if (p < 90.0f)  lv_label_set_text(id(lbl_batt_icon), "\U000F0081");
+              else if (p < 100.0f) lv_label_set_text(id(lbl_batt_icon), "\U000F0082");
+              else                 lv_label_set_text(id(lbl_batt_icon), "\U000F0079");
+            }
+
+            lv_obj_set_style_text_color(id(lbl_batt_icon), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          }
+
+          // ===== Status-Text (lbl_status) =====
+          {
+            std::string stage  = stg;
+            std::string status = ps;
+            int p              = prog;
+
+            // ---------- 1. Text setzen ----------
+            // Filament-Stages
+            if (stage.find("filament_loading") != std::string::npos) {
+              lv_label_set_text(id(lbl_status), "loading");
+            } else if (stage.find("filament_unloading") != std::string::npos) {
+              lv_label_set_text(id(lbl_status), "unloading");
+            }
+            // Fehler (wirklich fatal)
+            else if (fatal_err) {
+              lv_label_set_text(id(lbl_status), "failed");
+            }
+            // Warnung: HMS aktiv, aber Druck läuft weiter
+            else if (warn_hms) {
+              // Wenn du es dezenter willst:
+              // lv_label_set_text(id(lbl_status), "printing (HMS)");
+              // oder einfach: nichts Besonderes, wir lassen die nächsten Zweige entscheiden.
+              lv_label_set_text(id(lbl_status), "printing");
+            }
+            // DONE strikt
+            else if (done_strict) {
+              lv_label_set_text(id(lbl_status), "done");
+            }
+            // Restliche Zustände
+            else {
+              bool idleish    = stage.find("idle")    != std::string::npos
+                             || stage.find("offline") != std::string::npos;
+              bool is_offline = stage.find("offline") != std::string::npos;
+
+              if (idleish) {
+                // OFFLINE immer klar anzeigen
+                if (is_offline) {
+                  lv_label_set_text(id(lbl_status), "offline");
+                }
+                // IDLE mit prepare
+                else if (status == "prepare") {
+                  lv_label_set_text(id(lbl_status), "preparing");
+                }
+                // „printing“, wenn wirklich aktiv
+                else if ((p > 0 && p < 100) || id(print_active)) {
+                  lv_label_set_text(id(lbl_status), "printing");
+                } else {
+                  lv_label_set_text(id(lbl_status), "idle");
+                }
+              } else {
+                // schönere Namen basteln
+                auto pretty_stage = [&](const std::string &t)->std::string {
+                  if (t.find("printing")            != std::string::npos) return "printing";
+                  if (t.find("auto_bed_leveling")   != std::string::npos
+                   || t.find("bed_level")           != std::string::npos) return "bed level";
+                  if (t.find("heatbed_preheating")  != std::string::npos
+                   || t.find("nozzle_preheating")   != std::string::npos
+                   || t.find("preheat")             != std::string::npos) return "preheating";
+                  if (t.find("cleaning_nozzle_tip") != std::string::npos
+                   || t.find("clean")               != std::string::npos) return "clean nozzle";
+                  if (t.find("cooling_down")        != std::string::npos
+                   || t.find("cool")                != std::string::npos) return "cooling";
+                  if (t == "idle")      return "idle";
+                  if (t == "offline")   return "offline";
+                  return "";
+                };
+                auto pretty_ps = [&](const std::string &t)->std::string {
+                  if (t == "prepare")                  return "preparing";
+                  if (t == "running")                  return "printing";
+                  if (t == "finish" || t == "finished")return "printing";
+                  if (t == "failed")                   return "failed";
+                  if (t.find("pause")  != std::string::npos) return "paused";
+                  if (t.find("cool")   != std::string::npos) return "cooling";
+                  return "";
+                };
+
+                std::string s1 = pretty_stage(stage);
+                if (!s1.empty()
+                    && stage.find("idle")    == std::string::npos
+                    && stage.find("offline") == std::string::npos) {
+                  lv_label_set_text(id(lbl_status), s1.c_str());
+                } else {
+                  std::string s2 = pretty_ps(status);
+                  if (!s2.empty()) {
+                    lv_label_set_text(id(lbl_status), s2.c_str());
+                  } else if (!stage.empty()) {
+                    std::string s = shorten(titlecase(stage), 18);
+                    lv_label_set_text(id(lbl_status), s.c_str());
+                  } else if (!status.empty()) {
+                    std::string s = shorten(titlecase(status), 18);
+                    lv_label_set_text(id(lbl_status), s.c_str());
+                  } else {
+                    lv_label_set_text(id(lbl_status), "waiting...");
+                  }
+                }
+              }
+            }
+
+            // ---------- 2. Farbe setzen ----------
+            // Filament = gelb
+            if (stage.find("filament_loading")   != std::string::npos
+             || stage.find("filament_unloading") != std::string::npos) {
+              lv_obj_set_style_text_color(
+                id(lbl_status),
+                lv_color_hex(id(col_ring_filament)),
+                LV_PART_MAIN
+              );
+            }
+            // Fehler = rot
+            else if (fatal_err) {
+              lv_obj_set_style_text_color(
+                id(lbl_status),
+                lv_color_hex(0xFF3333),
+                LV_PART_MAIN
+              );
+            }
+            // reine HMS-Warnung bei laufendem Druck = z.B. gelblich
+            else if (warn_hms) {
+              lv_obj_set_style_text_color(
+                id(lbl_status),
+                lv_color_hex(0xFFD54F),  // gleiche Tönung wie Filament-Ring
+                LV_PART_MAIN
+              );
+            }
+            // DONE = blau
+            else if (done_strict) {
+              lv_obj_set_style_text_color(
+                id(lbl_status),
+                lv_color_hex(0x00BFFF),
+                LV_PART_MAIN
+              );
+            }
+            // Rest
+            else {
+              bool idleish    = stage.find("idle")    != std::string::npos
+                             || stage.find("offline") != std::string::npos;
+              bool is_offline = stage.find("offline") != std::string::npos;
+
+              if (idleish) {
+                if (is_offline) {
+                  // Offline: dezentes Grau
+                  lv_obj_set_style_text_color(
+                    id(lbl_status),
+                    lv_color_hex(0x888888),
+                    LV_PART_MAIN
+                  );
+                } else if (status == "prepare") {
+                  // Idle + prepare = orange
+                  lv_obj_set_style_text_color(
+                    id(lbl_status),
+                    lv_color_hex(0xFFA500),
+                    LV_PART_MAIN
+                  );
+                } else if ((p > 0 && p < 100) || id(print_active)) {
+                  // Job aktiv im Idle-Stage
+                  lv_obj_set_style_text_color(
+                    id(lbl_status),
+                    lv_color_hex(0xFFFFFF),
+                    LV_PART_MAIN
+                  );
+                } else {
+                  // Normales Idle
+                  lv_obj_set_style_text_color(
+                    id(lbl_status),
+                    lv_color_hex(0xAAAAAA),
+                    LV_PART_MAIN
+                  );
+                }
+              } else if (stage.find("heatbed_preheating") != std::string::npos
+                      || stage.find("nozzle_preheating")  != std::string::npos
+                      || stage.find("preheat")            != std::string::npos
+                      || stage.find("cleaning_nozzle_tip")!= std::string::npos
+                      || stage.find("clean")              != std::string::npos
+                      || stage.find("auto_bed_leveling")  != std::string::npos
+                      || stage.find("bed_level")          != std::string::npos) {
+                // Preheat/Clean/Level = orange
+                lv_obj_set_style_text_color(
+                  id(lbl_status),
+                  lv_color_hex(0xFFA500),
+                  LV_PART_MAIN
+                );
+              } else if (stage.find("cooling_down") != std::string::npos
+                      || stage.find("cool")        != std::string::npos) {
+                // Cooling = Ring-Cool-Farbe
+                lv_obj_set_style_text_color(
+                  id(lbl_status),
+                  lv_color_hex(id(col_ring_cool)),
+                  LV_PART_MAIN
+                );
+              } else {
+                // Default: weiß
+                lv_obj_set_style_text_color(
+                  id(lbl_status),
+                  lv_color_hex(0xFFFFFF),
+                  LV_PART_MAIN
+                );
+              }
+            }
+          }
+
+          // ===== Remaining-Time =====
+          {
+            std::string ps  = id(print_status).has_state()   ? lower(id(print_status).state)   : "";
+            std::string stg = id(current_stage).has_state()  ? lower(id(current_stage).state)  : "";
+            int p = prog;
+            const bool offline_now = stg.find("offline") != std::string::npos;
+
+            bool done_strict_local = ((ps == "finish" || ps == "finished" || ps.find("finish") != std::string::npos)
+                                      && (stg.find("idle") != std::string::npos)
+                                      && (p == 100));
+            if (done_strict_local) {
+              lv_label_set_text(id(lbl_remaining), "Done");
+            } else {
+              bool valid = false;
+              int minutes = 0;
+              if (!offline_now && id(remaining_time).has_state()) {
+                float m_raw = id(remaining_time).state;
+                if (!isnan(m_raw) && m_raw >= 0.0f && m_raw <= 10000.0f) {
+                  valid = true;
+                  minutes = (int) lroundf(m_raw);
+                }
+              }
+
+              if (valid) {
+                int h = minutes / 60;
+                int m = minutes % 60;
+                char buf[32];
+                if (h > 0) snprintf(buf, sizeof(buf), "%dh %dm", h, m);
+                else       snprintf(buf, sizeof(buf), "%dm", m);
+                lv_label_set_text(id(lbl_remaining), buf);
+              } else {
+                lv_label_set_text(id(lbl_remaining), "--m");
+              }
+            }
+
+            // Farben konstant
+            lv_obj_set_style_text_color(id(lbl_remaining),      lv_color_hex(0x87CEEB), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(lbl_remaining_icon), lv_color_hex(0x87CEEB), LV_PART_MAIN);
+
+            // FPS: keine dynamische Breite / kein Re-Layout während Scroll
+            if (lv_obj_get_width(id(row_remaining)) != 280) {
+              lv_obj_set_width(id(row_remaining), 280);
+            }
+            lv_obj_align(id(row_remaining), LV_ALIGN_CENTER, 0, 190);
+          }
+
+          // ===== Layer-Label =====
+          {
+            const bool offline_now = stg.find("offline") != std::string::npos;
+            int cur = -1;
+            int tot = -1;
+
+            if (!offline_now && id(current_layer).has_state()) {
+              float cur_raw = id(current_layer).state;
+              if (!isnan(cur_raw) && cur_raw >= 0.0f && cur_raw <= 20000.0f) {
+                cur = (int) lroundf(cur_raw);
+              }
+            }
+            if (!offline_now && id(total_layer).has_state()) {
+              float tot_raw = id(total_layer).state;
+              if (!isnan(tot_raw) && tot_raw >= 0.0f && tot_raw <= 20000.0f) {
+                tot = (int) lroundf(tot_raw);
+              }
+            }
+
+            char buf[32];
+            if (cur >= 0 && tot >= 0) {
+              if (cur > tot) cur = tot;
+              snprintf(buf, sizeof(buf), "layer: %d / %d", cur, tot);
+            } else if (cur >= 0) {
+              snprintf(buf, sizeof(buf), "layer: %d / --", cur);
+            } else if (tot >= 0) {
+              snprintf(buf, sizeof(buf), "layer: -- / %d", tot);
+            } else {
+              snprintf(buf, sizeof(buf), "layer: -- / --");
+            }
+            lv_label_set_text(id(lbl_layer), buf);
+            lv_obj_set_style_text_color(id(lbl_layer), lv_color_hex(0xDDDDDD), LV_PART_MAIN);
+          }
+
+          // ===== Nozzle-Temp =====
+          {
+            char buf[24];
+            const bool offline_now = stg.find("offline") != std::string::npos;
+            bool valid = false;
+            int t_int = 0;
+            if (!offline_now && id(nozzle_temp).has_state()) {
+              float t = id(nozzle_temp).state;
+              if (!isnan(t) && t >= -20.0f && t <= 400.0f) {
+                valid = true;
+                t_int = (int) lroundf(t);
+              }
+            }
+            if (valid) snprintf(buf, sizeof(buf), " %d\xC2\xB0""C", t_int);
+            else       snprintf(buf, sizeof(buf), " --\xC2\xB0""C");
+            lv_label_set_text(id(lbl_nozzle), buf);
+            lv_obj_set_style_text_color(id(lbl_nozzle), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          }
+
+          // ===== Bed-Temp =====
+          {
+            char buf[24];
+            const bool offline_now = stg.find("offline") != std::string::npos;
+            bool valid = false;
+            int t_int = 0;
+            if (!offline_now && id(bed_temp).has_state()) {
+              float t = id(bed_temp).state;
+              if (!isnan(t) && t >= -20.0f && t <= 180.0f) {
+                valid = true;
+                t_int = (int) lroundf(t);
+              }
+            }
+            if (valid) snprintf(buf, sizeof(buf), " %d\xC2\xB0""C", t_int);
+            else       snprintf(buf, sizeof(buf), " --\xC2\xB0""C");
+            lv_label_set_text(id(lbl_bed), buf);
+            lv_obj_set_style_text_color(id(lbl_bed), lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+          }
+
+          // ===== Ziel-Farbe für den Printing-Blend (ui_col_target) =====
+          {
+            uint32_t col = id(col_ring_printing); // default: printing
+
+            if (done_strict) {
+              col = id(col_ring_done);
+            } else if (stg.find("heatbed") != std::string::npos
+                    || stg.find("preheat") != std::string::npos
+                    || stg.find("nozzle_preheating") != std::string::npos) {
+              col = id(col_ring_preheat);
+            } else if (stg.find("clean") != std::string::npos) {
+              col = id(col_ring_clean);
+            } else if (stg.find("auto_bed_leveling") != std::string::npos
+                    || stg.find("bed_level")         != std::string::npos) {
+              col = id(col_ring_level);
+            } else if (stg.find("cool") != std::string::npos) {
+              col = id(col_ring_cool);
+            } else if (stg.find("idle") != std::string::npos
+                    || stg.find("offline") != std::string::npos) {
+              col = ( (prog > 0 && prog < 100) || ps == "running" || ps == "prepare" )
+                      ? id(col_ring_idle_active)
+                      : id(col_ring_idle);
+            }
+            id(ui_col_target) = col;
+          }
+
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (!id(ui_built)) return;
+          if (id(screen_off) || id(ultra_power)) return;
+          if (!id(page3_active)) return;
+          if (id(is_scrolling)) return;
+          if (id(wifi_state) != 2) return;
+
+          const uint32_t now = millis();
+          const uint32_t TOUCH_COOLDOWN_MS = 800;   // nach Touch/Geste kurz keine neuen Fetches
+          const uint32_t MIN_FRAME_MS = 2000;       // ~0.5 FPS (Start-zu-Start)
+          const uint32_t FETCH_WATCHDOG_MS = 4500;  // in_flight bei HÃ¤ngern freigeben
+
+          if (now - id(last_touch_ms) < TOUCH_COOLDOWN_MS) return;
+
+          if (id(cam_fetch_in_flight)) {
+            if (now - id(cam_fetch_started_ms) > FETCH_WATCHDOG_MS) {
+              ESP_LOGW("cam", "Camera fetch watchdog -> clear in_flight");
+              id(cam_fetch_in_flight) = false;
+            } else {
+              return;
+            }
+          }
+
+          if (now - id(cam_fetch_last_ms) < MIN_FRAME_MS) return;
+
+          char url[512];
+          snprintf(url, sizeof(url),
+                   "%s/api/camera_proxy/camera.%s?width=400&height=225&time=%lu",
+                   "${homeassistant_url}", "${ha_cam_entity_id}", (unsigned long)now);
+
+          id(cam_fetch_in_flight) = true;
+          id(cam_fetch_started_ms) = now;
+          id(cam_fetch_last_ms) = now;
+          id(ha_cam).set_url(url);
+          id(ha_cam).update();
