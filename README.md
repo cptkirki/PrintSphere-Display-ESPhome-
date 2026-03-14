@@ -1,5 +1,5 @@
 ## https://github.com/cptkirki/PrintSphere-Display-ESPhome-/tree/Amoled-1.75
-## Bigger 1.75" screen version available now
+# Bigger 1.75" screen version available now - https://github.com/cptkirki/PrintSphere
 
 # PrintSphere-Display (ESPHome + LVGL, Round AMOLED)
 
