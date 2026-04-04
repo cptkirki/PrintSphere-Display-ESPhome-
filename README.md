@@ -148,7 +148,7 @@ camera:
     max_image_width: 400
     max_image_height: 225
     max_stream_width: 400
-    max_stream_height: 225'
+    max_stream_height: 225
 
   ```  
 
